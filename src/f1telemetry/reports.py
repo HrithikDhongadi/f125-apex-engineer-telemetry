@@ -83,6 +83,12 @@ def build_markdown(session: Any, laps: list[Any], notes: dict[str, str], track_l
         lines.extend([
             f"### Lap {lap.number} — {_time(lap.time_ms)}{' — INVALID' if lap.invalid else ''}", "",
             f"- Data quality: {quality['alignment']}; distance span {quality['distance_span_m'] if quality['distance_span_m'] is not None else 'unavailable'} m; PB-eligible coverage: {'yes' if quality['adequate_for_pb'] else 'no'}.",
+            f"- Recorded timeline events: {len(lap.events)}.",
+            *[
+                f"  - {event.get('type', 'event')}: {event.get('from_lap_time_ms', 'unknown')}→{event.get('to_lap_time_ms', 'unknown')} ms, "
+                f"{event.get('from_lap_distance_m', 'unknown')}→{event.get('to_lap_distance_m', 'unknown')} m"
+                for event in lap.events
+            ],
             *[f"- {item}" for item in _observations(lap)], "",
         ])
     lines.extend(["## Compatible lap deltas", ""])

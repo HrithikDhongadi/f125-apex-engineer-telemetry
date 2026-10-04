@@ -32,6 +32,7 @@ class PacketHeader:
     session_uid: int
     session_time: float
     frame_identifier: int
+    overall_frame_identifier: int
     player_car_index: int
 
 
@@ -48,7 +49,7 @@ def decode_header(data: bytes) -> PacketHeader | None:
         session_uid,
         session_time,
         frame_identifier,
-        _overall_frame,
+        overall_frame_identifier,
         player_car_index,
         _secondary_player,
     ) = HEADER.unpack_from(data)
@@ -60,6 +61,7 @@ def decode_header(data: bytes) -> PacketHeader | None:
         session_uid=session_uid,
         session_time=session_time,
         frame_identifier=frame_identifier,
+        overall_frame_identifier=overall_frame_identifier,
         player_car_index=player_car_index,
     )
 

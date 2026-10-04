@@ -3,7 +3,7 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;
 const fmtTime = (ms) => ms == null ? "—" : `${Math.floor(ms / 60000)}:${String(((ms % 60000) / 1000).toFixed(3)).padStart(6, "0")}`;
 const fmtSetup = (s) => s ? `${s.front_wing??"unknown"}/${s.rear_wing??"unknown"} wings · ${s.on_throttle_diff??"unknown"}/${s.off_throttle_diff??"unknown"}% diff · ${setupFields.filter(f=>s[f.key]!==undefined).length}/${setupFields.length} fields` : "unknown";
 const colors = {green:"#65e6ad",orange:"#ffad5a",blue:"#65b8ff",red:"#ff7379",yellow:"#ffd166"};
-let sessions = [], laps = [], allLaps = [], personalBests = [], setupFields = [], selectedLapIds = new Set(), selectedSessionId = null, activeRecording = null, latestState = {}, comparison = null, editingLap = null;
+let sessions = [], laps = [], allLaps = [], personalBests = [], setupFields = [], selectedLapIds = new Set(), selectedSessionId = null, activeRecording = null, latestState = {}, diagnosticState = {}, comparison = null, editingLap = null;
 
 async function request(url, options) {
   const response = await fetch(url, options);
@@ -59,6 +59,10 @@ function renderRecorder() {
   $("stop-recording").hidden=!recording;
   $("jump-active").hidden=!recording||recording.id===selectedSessionId;
   $("historical-badge").hidden=Boolean(recording&&recording.id===selectedSessionId);
+  $("diagnostic-enabled").checked=Boolean(diagnosticState.enabled);
+  $("diagnostic-status").textContent=diagnosticState.enabled
+    ? `Diagnostics on${diagnosticState.active_file?` · ${diagnosticState.active_file} · ${diagnosticState.events} events`:" · the next recording will create a bounded trace"}${diagnosticState.truncated?" · size limit reached":""}.`
+    : "Diagnostics are off. Enable before starting the short test run.";
   if(!recording) $("historical-badge").textContent="Historical/closed session · live telemetry remains current";
   else $("historical-badge").textContent="Historical view · live telemetry remains current";
 }
@@ -101,7 +105,7 @@ function checkCompatibility(){const b=chosenMeta("baseline"),c=chosenMeta("candi
 function sampleRate(lap){const seconds=(lap.last_session_time??0)-(lap.first_session_time??0);return seconds>0?`${(lap.sample_count/seconds).toFixed(1)} Hz`:"—";}
 function renderSession(){
   const sorted=[...laps].sort((a,b)=>a.time_ms-b.time_ms);$("lap-count").textContent=`${laps.length} lap${laps.length===1?"":"s"}`;
-  $("session-laps").innerHTML=sorted.map(lap=>`<tr class="${lap.invalid?"invalid-row":""}"><td><input type="checkbox" class="lap-export-check" data-id="${esc(lap.id)}" ${selectedLapIds.has(lap.id)?"checked":""} aria-label="Select lap ${lap.number} for export"></td><td>Lap ${lap.number}${lap.invalid?" · INVALID":""}</td><td class="time">${fmtTime(lap.time_ms)}</td><td>${fmtTime(lap.sector1_ms)} / ${fmtTime(lap.sector2_ms)}</td><td>${esc(fmtSetup(lap.setup))}</td><td>${lap.sample_count}<br><span class="hint">${sampleRate(lap)}</span></td><td>${lap.peak_speed_kph??"—"} / ${lap.minimum_speed_kph??"—"} km/h</td><td><input class="tag-input" data-id="${esc(lap.id)}" maxlength="240" value="${esc(lap.note)}" placeholder="e.g. rear wing +1"></td><td><button class="edit-setup" data-id="${esc(lap.id)}">Edit/Add setup</button></td></tr>`).join("")||'<tr><td colspan="9">No completed laps in this session.</td></tr>';
+  $("session-laps").innerHTML=sorted.map(lap=>`<tr class="${lap.invalid?"invalid-row":""}"><td><input type="checkbox" class="lap-export-check" data-id="${esc(lap.id)}" ${selectedLapIds.has(lap.id)?"checked":""} aria-label="Select lap ${lap.number} for export"></td><td>Lap ${lap.number}${lap.invalid?" · INVALID":""}${lap.event_count?`<br><span class="hint">${lap.event_count} flashback/restart event${lap.event_count===1?"":"s"}</span>`:""}</td><td class="time">${fmtTime(lap.time_ms)}</td><td>${fmtTime(lap.sector1_ms)} / ${fmtTime(lap.sector2_ms)}</td><td>${esc(fmtSetup(lap.setup))}</td><td>${lap.sample_count}<br><span class="hint">${sampleRate(lap)}</span></td><td>${lap.peak_speed_kph??"—"} / ${lap.minimum_speed_kph??"—"} km/h</td><td><input class="tag-input" data-id="${esc(lap.id)}" maxlength="240" value="${esc(lap.note)}" placeholder="e.g. rear wing +1"></td><td><button class="edit-setup" data-id="${esc(lap.id)}">Edit/Add setup</button></td></tr>`).join("")||'<tr><td colspan="9">No completed laps in this session.</td></tr>';
   document.querySelectorAll(".tag-input").forEach(input=>input.addEventListener("change",()=>saveNote(input)));
   document.querySelectorAll(".lap-export-check").forEach(input=>input.addEventListener("change",()=>{if(input.checked)selectedLapIds.add(input.dataset.id);else selectedLapIds.delete(input.dataset.id);updateExportCount();}));
   document.querySelectorAll(".edit-setup").forEach(button=>button.addEventListener("click",()=>openSetupEditor(button.dataset.id)));
@@ -152,6 +156,7 @@ $("baseline").addEventListener("change",checkCompatibility);$("candidate").addEv
 $("session-select").addEventListener("change",event=>selectSession(event.target.value));
 $("start-run").addEventListener("click",async()=>{try{await post("/api/runs/start",{name:$("run-name").value});$("run-name").value="";await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
 $("stop-recording").addEventListener("click",async()=>{try{await post("/api/recording/stop");await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
+$("diagnostic-enabled").addEventListener("change",async event=>{event.target.disabled=true;try{diagnosticState=await post("/api/diagnostics",{enabled:event.target.checked});renderRecorder();}catch(error){$("recording-message").textContent=error.message;}finally{event.target.disabled=false;}});
 $("jump-active").addEventListener("click",()=>activeRecording&&selectSession(activeRecording.id));
 $("rename-button").addEventListener("click",async()=>{try{await post(`/api/sessions/${encodeURIComponent(selectedSessionId)}/rename`,{name:$("rename-session").value});await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
 $("track-override-button").addEventListener("click",async()=>{try{await post(`/api/sessions/${encodeURIComponent(selectedSessionId)}/track-name`,{name:$("track-override").value});await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
@@ -165,9 +170,9 @@ $("setup-close").addEventListener("click",()=>$("setup-dialog").close());
 $("setup-form").addEventListener("submit",async event=>{event.preventDefault();const changed={};document.querySelectorAll("#setup-fields input").forEach(input=>{if(input.value!==input.dataset.original&&input.value!=="")changed[input.dataset.key]=Number(input.value);});if(!Object.keys(changed).length){$("setup-message").textContent="No values changed.";return;}try{const result=await post(`/api/laps/${encodeURIComponent(editingLap.id)}/setup`,{setup:changed});$("setup-message").textContent=`Saved. ${result.pb_message}. Audit: ${result.audit_record}`;setTimeout(()=>$("setup-dialog").close(),900);await loadLibrary();}catch(error){$("setup-message").textContent=error.message;}});
 
 async function loadLibrary(){
-  const [data,pbData,schema]=await Promise.all([request("/api/sessions"),request("/api/personal-bests"),request("/api/setup-schema")]);sessions=data.sessions;personalBests=pbData.personal_bests;setupFields=schema.fields;selectedSessionId=data.selected_session_id;activeRecording=data.recording;latestState={...latestState,...data.latest};
+  const [data,pbData,schema]=await Promise.all([request("/api/sessions"),request("/api/personal-bests"),request("/api/setup-schema")]);sessions=data.sessions;personalBests=pbData.personal_bests;setupFields=schema.fields;selectedSessionId=data.selected_session_id;activeRecording=data.recording;diagnosticState=data.diagnostics||{};latestState={...latestState,...data.latest};
   const groups=await Promise.all(sessions.map(session=>request(`/api/sessions/${encodeURIComponent(session.id)}/laps`)));allLaps=groups.flatMap(group=>group.laps);laps=groups.find(group=>group.session_id===selectedSessionId)?.laps||[];
   selectedLapIds=new Set([...selectedLapIds].filter(id=>laps.some(lap=>lap.id===id)));renderSessionLibrary();renderPersonalBests();populateSelectors();if(!document.querySelector(".tag-input:focus"))renderSession();
 }
-async function refreshLive(){try{const data=await request("/api/snapshot");activeRecording=data.recording;selectedSessionId=data.selected_session_id;renderLive(data.latest);renderRecorder();}catch(_){$("connection").textContent="Dashboard offline";$("connection").classList.remove("online");}}
+async function refreshLive(){try{const data=await request("/api/snapshot");activeRecording=data.recording;selectedSessionId=data.selected_session_id;diagnosticState=data.diagnostics||{};renderLive(data.latest);renderRecorder();}catch(_){$("connection").textContent="Dashboard offline";$("connection").classList.remove("online");}}
 loadLibrary();refreshLive();setInterval(refreshLive,1000);setInterval(loadLibrary,8000);

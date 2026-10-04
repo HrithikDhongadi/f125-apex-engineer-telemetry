@@ -92,6 +92,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return self._json(self.store.start_time_trial_run(str(payload.get("name", ""))), 201)
             if path == "/api/recording/stop":
                 return self._json(self.store.stop_recording())
+            if path == "/api/diagnostics":
+                if not isinstance(payload.get("enabled"), bool):
+                    return self._json({"error": "enabled must be true or false"}, 400)
+                return self._json(self.store.configure_diagnostics(payload["enabled"]))
             if path == "/api/personal-bests/rebuild":
                 return self._json(self.store.rebuild_personal_bests())
             if path == "/api/sessions/select":

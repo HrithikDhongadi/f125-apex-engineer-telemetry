@@ -24,6 +24,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNotNone(decoded_header)
         telemetry = decode_player_car_telemetry(packet, decoded_header)
         self.assertEqual(HEADER_SIZE, 29)
+        self.assertEqual(decoded_header.frame_identifier, 17)
+        self.assertEqual(decoded_header.overall_frame_identifier, 17)
         self.assertEqual(telemetry["speed_kph"], 301)
         self.assertEqual(telemetry["gear"], 7)
         self.assertEqual(telemetry["brake_temps_c"], (500, 501, 502, 503))

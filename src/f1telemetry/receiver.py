@@ -24,6 +24,9 @@ from .setups import SetupValidationError, setup_rows, validate_manual_values, wi
 
 LEGACY_SESSION_ID = "legacy"
 OPEN_STATUSES = {"armed", "recording"}
+MAX_DIAGNOSTIC_SEGMENTS = 8
+MAX_DIAGNOSTIC_EVENTS = 50_000
+MAX_DIAGNOSTIC_BYTES = 50 * 1024 * 1024
 
 
 def utc_now() -> str:
@@ -36,6 +39,7 @@ class Lap:
     time_ms: int
     invalid: bool
     samples: list[dict[str, Any]] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
     setup: dict[str, Any] | None = None
     saved_at: str = ""
     sector1_ms: int | None = None
@@ -60,6 +64,7 @@ class Lap:
         return {
             "id": self.id, "number": self.number, "time_ms": self.time_ms,
             "invalid": self.invalid, "sample_count": len(self.samples),
+            "event_count": len(self.events), "events": self.events,
             "setup": self.setup, "saved_at": self.saved_at,
             "sector1_ms": self.sector1_ms, "sector2_ms": self.sector2_ms,
             "first_session_time": self.first_session_time,
@@ -163,9 +168,17 @@ class SessionStore:
         self.active_lap_number: int | None = None
         self.active_invalid = False
         self.active_samples: list[dict[str, Any]] = []
+        self.active_lap_events: list[dict[str, Any]] = []
+        self.pending_restart_event: dict[str, Any] | None = None
         self.active_lap_state: dict[str, Any] = {}
         self.active_lap_setup: dict[str, Any] | None = None
         self.capture_current_lap = False
+        self.diagnostics_enabled = False
+        self.diagnostic_path: Path | None = None
+        self.diagnostic_segment = -1
+        self.diagnostic_events = 0
+        self.diagnostic_bytes = 0
+        self.diagnostic_truncated = False
         self._load_all()
 
     def _load_notes(self) -> dict[str, str]:
@@ -315,11 +328,98 @@ class SessionStore:
             self.selected_session_id = session.id
         self.capture_current_lap = at_start
         self.active_samples = []
+        self.active_lap_events = []
+        self.pending_restart_event = None
         if at_start and self.active_lap_number is not None:
             self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
             self.active_invalid = bool(self.active_lap_state.get("invalid", False))
         self._persist_session(session)
+        if self.diagnostics_enabled:
+            self.diagnostic_path = None
+            self.diagnostic_segment = -1
+            self.diagnostic_events = 0
+            self.diagnostic_bytes = 0
+            self.diagnostic_truncated = False
+            self._start_diagnostic_segment("run-start")
+            self._write_diagnostic({
+                "event": "recording_started", "timestamp_utc": self._diagnostic_timestamp(),
+                "session_uid": self.game_session_uid, "recording_session_id": session.id,
+                "recording_status": session.status, "capture_current_lap": self.capture_current_lap,
+                "active_lap_number": self.active_lap_number, "sample_count": len(self.active_samples),
+                "previous_packet": dict(self.active_lap_state),
+                "reason": "new_recording_created_at_lap_start" if at_start else "new_recording_armed_midlap",
+            })
         return session
+
+    @staticmethod
+    def _diagnostic_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+    def diagnostic_status(self) -> dict[str, Any]:
+        return {
+            "enabled": self.diagnostics_enabled,
+            "active_file": str(self.diagnostic_path.relative_to(self.capture_dir)) if self.diagnostic_path else None,
+            "segment": self.diagnostic_segment if self.diagnostic_path else None,
+            "events": self.diagnostic_events,
+            "bytes": self.diagnostic_bytes,
+            "truncated": self.diagnostic_truncated,
+            "limits": {
+                "segments": MAX_DIAGNOSTIC_SEGMENTS,
+                "events_per_segment": MAX_DIAGNOSTIC_EVENTS,
+                "bytes_per_segment": MAX_DIAGNOSTIC_BYTES,
+            },
+        }
+
+    def configure_diagnostics(self, enabled: bool) -> dict[str, Any]:
+        with self.lock:
+            self.diagnostics_enabled = bool(enabled)
+            if not self.diagnostics_enabled:
+                self.diagnostic_path = None
+            elif self.active_recording_id is not None and self.diagnostic_path is None:
+                self._start_diagnostic_segment("manual-enable")
+                self._write_diagnostic({
+                    "event": "diagnostics_enabled", "timestamp_utc": self._diagnostic_timestamp(),
+                    "session_uid": self.game_session_uid, "recording_session_id": self.active_recording_id,
+                    "recording_status": self.sessions[self.active_recording_id].status,
+                    "capture_current_lap": self.capture_current_lap,
+                    "active_lap_number": self.active_lap_number, "sample_count": len(self.active_samples),
+                    "previous_packet": dict(self.active_lap_state), "reason": "operator_opt_in",
+                })
+            return self.diagnostic_status()
+
+    def _start_diagnostic_segment(self, reason: str) -> None:
+        if not self.diagnostics_enabled or self.active_recording_id is None:
+            return
+        next_segment = self.diagnostic_segment + 1
+        if next_segment >= MAX_DIAGNOSTIC_SEGMENTS:
+            self.diagnostic_truncated = True
+            return
+        self.diagnostic_segment = next_segment
+        self.diagnostic_events = 0
+        self.diagnostic_bytes = 0
+        self.diagnostic_truncated = False
+        directory = self.sessions_dir / self.active_recording_id / "diagnostics"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_reason = "".join(character if character.isalnum() or character == "-" else "-" for character in reason)
+        self.diagnostic_path = directory / f"lap-data-{next_segment:02d}-{safe_reason}.jsonl"
+
+    def _write_diagnostic(self, event: dict[str, Any]) -> None:
+        if not self.diagnostics_enabled or self.active_recording_id is None or self.diagnostic_path is None or self.diagnostic_truncated:
+            return
+        line = (json.dumps(event, separators=(",", ":")) + "\n").encode("utf-8")
+        if self.diagnostic_events >= MAX_DIAGNOSTIC_EVENTS or self.diagnostic_bytes + len(line) > MAX_DIAGNOSTIC_BYTES:
+            self.diagnostic_truncated = True
+            marker = json.dumps({
+                "event": "diagnostic_limit_reached", "timestamp_utc": self._diagnostic_timestamp(),
+                "events": self.diagnostic_events, "bytes": self.diagnostic_bytes,
+            }, separators=(",", ":")) + "\n"
+            with self.diagnostic_path.open("ab") as stream:
+                stream.write(marker.encode("utf-8"))
+            return
+        with self.diagnostic_path.open("ab") as stream:
+            stream.write(line)
+        self.diagnostic_events += 1
+        self.diagnostic_bytes += len(line)
 
     def start_time_trial_run(self, name: str) -> dict[str, Any]:
         with self.lock:
@@ -337,6 +437,8 @@ class SessionStore:
                 self.manual_stop_uid = session.game_session_uid
             self._close_active("stopped")
             self.active_samples = []
+            self.active_lap_events = []
+            self.pending_restart_event = None
             self.capture_current_lap = False
             return session.summary(self.session_laps[session.id])
 
@@ -353,6 +455,8 @@ class SessionStore:
         self.active_recording_id = None
         self.capture_current_lap = False
         self.active_samples = []
+        self.active_lap_events = []
+        self.pending_restart_event = None
 
     def rename_session(self, session_id: str, name: str) -> dict[str, Any]:
         with self.lock:
@@ -411,6 +515,8 @@ class SessionStore:
         self.active_lap_number = None
         self.active_invalid = False
         self.active_samples = []
+        self.active_lap_events = []
+        self.pending_restart_event = None
         self.active_lap_state = {}
         self.active_lap_setup = None
         self.capture_current_lap = False
@@ -419,18 +525,35 @@ class SessionStore:
         self.active_lap_number = lap_number
         self.active_invalid = False
         self.active_samples = []
+        self.active_lap_events = []
         self.active_lap_state = {}
         self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
         self.capture_current_lap = capture
 
-    def record_lap_state(self, lap_state: dict[str, Any], session_uid: int | None = None) -> None:
+    def record_lap_state(
+        self,
+        lap_state: dict[str, Any],
+        session_uid: int | None = None,
+        packet_meta: dict[str, Any] | None = None,
+    ) -> None:
         with self.lock:
             self._observe_uid(session_uid)
+            previous_packet = dict(self.active_lap_state)
+            active_before = self.active_lap_number
+            capture_before = self.capture_current_lap
+            samples_before = len(self.active_samples)
+            active_session = self.sessions.get(self.active_recording_id or "")
+            status_before = active_session.status if active_session else None
+            reasons: list[str] = []
+            decision = "observe"
+            flags: dict[str, Any] = {}
             lap_number = int(lap_state["lap_number"])
             if self.active_lap_number is None:
                 # With no earlier Lap Data there is no proof that this is the
                 # beginning of a full lap. Stay armed until a verified crossing.
                 self._begin_lap(lap_number, False)
+                decision = "initial_observation"
+                reasons.append("no_previous_lap_packet_so_full_lap_start_is_unproven")
             else:
                 old_number = self.active_lap_number
                 old_time = self.active_lap_state.get("current_lap_ms")
@@ -438,16 +561,40 @@ class SessionStore:
                 new_time = int(lap_state.get("current_lap_ms", 0))
                 new_distance = float(lap_state.get("lap_distance_m", 0))
                 track_length = float(self.track_length_m or 0)
+                time_reversed = old_time is not None and new_time + 1_000 < int(old_time)
+                distance_reversed = old_distance is not None and new_distance + 50 < float(old_distance)
+                lap_number_reversed = lap_number < old_number
                 near_line = new_time <= 5_000 and -200 <= new_distance <= max(250, track_length * 0.05)
                 forward_number = lap_number > old_number
+                old_total_distance = self.active_lap_state.get("total_distance_m")
+                new_total_distance = lap_state.get("total_distance_m")
+                total_distance_step = (
+                    float(new_total_distance) - float(old_total_distance)
+                    if old_total_distance is not None and new_total_distance is not None else None
+                )
+                total_distance_reversed = bool(
+                    total_distance_step is not None and total_distance_step < -50
+                )
+                continuous_forward_distance = bool(
+                    total_distance_step is not None
+                    and -5 <= total_distance_step <= max(250, track_length * 0.05)
+                )
+                timed_same_number_wrap = bool(
+                    old_time is not None and int(old_time) > 0
+                    and new_time + 1_000 < int(old_time)
+                )
+                untimed_approach_wrap = bool(
+                    old_time is not None and int(old_time) == 0
+                    and 0 <= new_time <= 5_000
+                )
                 wrapped_same_number = bool(
                     lap_number == old_number
                     and track_length > 100
                     and old_distance is not None
                     and float(old_distance) >= track_length * 0.85
                     and new_distance <= track_length * 0.05
-                    and old_time is not None
-                    and new_time + 1_000 < int(old_time)
+                    and continuous_forward_distance
+                    and (timed_same_number_wrap or untimed_approach_wrap)
                 )
                 crossed_from_negative = bool(
                     lap_number == old_number
@@ -455,33 +602,188 @@ class SessionStore:
                     and -200 <= float(old_distance) < 0 <= new_distance
                     and new_time <= 5_000
                 )
-                new_lap_started = near_line and (forward_number or wrapped_same_number or crossed_from_negative)
-                completed_lap_available = new_lap_started and int(lap_state.get("last_lap_ms", 0)) >= 30_000
+                reset_to_start = bool(
+                    lap_number <= old_number
+                    and (time_reversed or distance_reversed or total_distance_reversed)
+                    and old_distance is not None
+                    and float(old_distance) > max(250, track_length * 0.05)
+                    and not continuous_forward_distance
+                    and new_time <= 5_000
+                    and -200 <= new_distance <= 100
+                )
+                restart_lap_started = reset_to_start and new_distance >= 0
+                restart_approach = bool(
+                    lap_number <= old_number
+                    and total_distance_reversed
+                    and new_time <= 5_000
+                )
+                crossed_start_line = near_line and (forward_number or wrapped_same_number or crossed_from_negative)
+                new_lap_started = crossed_start_line or restart_lap_started
+                if self.diagnostics_enabled and (reset_to_start or restart_approach):
+                    self._start_diagnostic_segment("restart-lap")
+                elif self.diagnostics_enabled and (
+                    lap_number_reversed
+                    or ((time_reversed or distance_reversed or total_distance_reversed) and not new_lap_started)
+                ):
+                    self._start_diagnostic_segment(
+                        "lap-number-rewind" if lap_number_reversed else "time-distance-rewind"
+                    )
+                completed_lap_available = crossed_start_line and int(lap_state.get("last_lap_ms", 0)) >= 30_000
+                flags = {
+                    "near_line": near_line, "forward_number": forward_number,
+                    "wrapped_same_number": wrapped_same_number,
+                    "timed_same_number_wrap": timed_same_number_wrap,
+                    "untimed_approach_wrap": untimed_approach_wrap,
+                    "total_distance_step_m": total_distance_step,
+                    "total_distance_reversed": total_distance_reversed,
+                    "continuous_forward_distance": continuous_forward_distance,
+                    "crossed_from_negative": crossed_from_negative,
+                    "reset_to_start": reset_to_start,
+                    "restart_lap_started": restart_lap_started,
+                    "restart_approach": restart_approach,
+                    "new_lap_started": new_lap_started,
+                    "completed_lap_available": completed_lap_available,
+                }
 
                 if completed_lap_available and self.capture_current_lap:
-                    self._finish_lap(int(lap_state["last_lap_ms"]))
+                    saved, finish_reason = self._finish_lap(int(lap_state["last_lap_ms"]))
+                    decision = "finish_saved" if saved else "finish_rejected"
+                    reasons.append(finish_reason)
+                elif crossed_start_line and self.capture_current_lap:
+                    reasons.append("crossing_has_no_official_completed_lap_time")
                 if new_lap_started and self.active_recording_id is not None:
                     session = self.sessions[self.active_recording_id]
                     if session.status == "armed":
                         session.status = "recording"
                         self._persist_session(session)
                     capture = session.status == "recording"
+                    start_kind = (
+                        "restart_at_lap_start" if restart_lap_started
+                        else "lap_number_advanced" if forward_number
+                        else "same_number_wrap" if wrapped_same_number
+                        else "negative_distance_crossing"
+                    )
+                    reasons.append(f"verified_start_{start_kind}")
+                    if capture:
+                        decision = f"{decision}_and_start_capture" if decision.startswith("finish_") else "start_capture"
                 else:
                     capture = False
+                    if forward_number and not near_line:
+                        reasons.append("rejected_crossing_lap_number_advanced_but_time_or_distance_not_near_line")
+                        decision = "rejected_crossing"
+                    elif near_line and not (forward_number or wrapped_same_number or crossed_from_negative):
+                        reasons.append("rejected_crossing_near_line_without_transition_evidence")
                 if lap_number != old_number or new_lap_started:
+                    if lap_number != old_number and not new_lap_started:
+                        reasons.append("active_lap_changed_without_verified_crossing_capture_disabled")
+                        if lap_number_reversed:
+                            reasons.append("discard_lap_number_decreased_probable_restart_or_flashback")
+                            decision = "discard_partial_lap"
                     self._begin_lap(lap_number, capture)
+                    restart_event = {
+                        "type": "restart_lap", "session_time": (packet_meta or {}).get("session_time"),
+                        "frame_identifier": (packet_meta or {}).get("frame_identifier"),
+                        "from_lap_time_ms": old_time, "to_lap_time_ms": new_time,
+                        "from_lap_distance_m": old_distance, "to_lap_distance_m": new_distance,
+                        "game_invalid": bool(lap_state.get("invalid", False)),
+                    }
+                    if restart_lap_started:
+                        self.active_lap_events.append(restart_event)
+                        self.pending_restart_event = None
+                    elif reset_to_start:
+                        self.pending_restart_event = restart_event
+                    elif crossed_start_line and capture and self.pending_restart_event is not None:
+                        self.active_lap_events.append(self.pending_restart_event)
+                        self.pending_restart_event = None
                 else:
-                    time_reversed = old_time is not None and new_time + 1_000 < int(old_time)
-                    distance_reversed = old_distance is not None and new_distance + 50 < float(old_distance)
-                    if time_reversed or distance_reversed:
-                        self.active_samples = []
-                        self.active_invalid = False
-                        self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
-                        self.capture_current_lap = False
+                    if time_reversed or distance_reversed or total_distance_reversed:
+                        if restart_approach:
+                            prior_event = self.active_lap_events[-1] if self.active_lap_events else None
+                            restart_event = {
+                                "type": "restart_lap", "session_time": (packet_meta or {}).get("session_time"),
+                                "frame_identifier": (packet_meta or {}).get("frame_identifier"),
+                                "from_lap_time_ms": (
+                                    prior_event.get("from_lap_time_ms")
+                                    if prior_event and prior_event.get("type") == "flashback" else old_time
+                                ),
+                                "to_lap_time_ms": new_time,
+                                "from_lap_distance_m": (
+                                    prior_event.get("from_lap_distance_m")
+                                    if prior_event and prior_event.get("type") == "flashback" else old_distance
+                                ),
+                                "to_lap_distance_m": new_distance,
+                                "game_invalid": bool(lap_state.get("invalid", False)),
+                            }
+                            self.active_samples = []
+                            self.active_lap_events = []
+                            self.active_invalid = False
+                            self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
+                            self.capture_current_lap = False
+                            self.pending_restart_event = restart_event
+                            reasons.append("restart_lap_relocated_to_untimed_approach")
+                            decision = "restart_approach_armed"
+                        elif self.capture_current_lap and lap_number == old_number:
+                            retained = [
+                                sample for sample in self.active_samples
+                                if (
+                                    not isinstance(sample.get("current_lap_ms"), (int, float))
+                                    or float(sample["current_lap_ms"]) <= new_time
+                                ) and (
+                                    not isinstance(sample.get("lap_distance_m"), (int, float))
+                                    or float(sample["lap_distance_m"]) <= new_distance
+                                )
+                            ]
+                            removed = len(self.active_samples) - len(retained)
+                            self.active_samples = retained
+                            self.active_lap_events.append({
+                                "type": "flashback", "session_time": (packet_meta or {}).get("session_time"),
+                                "frame_identifier": (packet_meta or {}).get("frame_identifier"),
+                                "from_lap_time_ms": old_time, "to_lap_time_ms": new_time,
+                                "from_lap_distance_m": old_distance, "to_lap_distance_m": new_distance,
+                                "pruned_sample_count": removed,
+                                "game_invalid": bool(lap_state.get("invalid", False)),
+                            })
+                            reasons.append("flashback_pruned_superseded_samples_capture_continues")
+                            decision = "flashback_continue_capture"
+                        else:
+                            self.active_samples = []
+                            self.active_lap_events = []
+                            self.active_invalid = False
+                            self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
+                            self.capture_current_lap = False
+                            reasons.append(
+                                "discard_time_and_distance_reversed" if time_reversed and distance_reversed
+                                else "discard_time_reversed" if time_reversed else "discard_distance_reversed"
+                            )
+                            decision = "discard_partial_lap"
+                    elif not reasons:
+                        reasons.append("continue_current_lap")
+                        decision = "continue_capture" if self.capture_current_lap else "continue_not_capturing"
             self.active_invalid = self.active_invalid or bool(lap_state["invalid"])
             self.active_lap_state.update(lap_state)
             self.latest.update(lap_state)
             self._touch()
+            active_session = self.sessions.get(self.active_recording_id or "")
+            self._write_diagnostic({
+                "event": "lap_data_decision", "timestamp_utc": self._diagnostic_timestamp(),
+                "session_uid": session_uid,
+                "session_time": (packet_meta or {}).get("session_time"),
+                "frame_identifier": (packet_meta or {}).get("frame_identifier"),
+                "overall_frame_identifier": (packet_meta or {}).get("overall_frame_identifier"),
+                "recording_session_id": self.active_recording_id,
+                "packet": dict(lap_state), "track_length_m": self.track_length_m,
+                "previous_packet": previous_packet,
+                "before": {
+                    "recording_status": status_before, "capture_current_lap": capture_before,
+                    "active_lap_number": active_before, "sample_count": samples_before,
+                },
+                "after": {
+                    "recording_status": active_session.status if active_session else None,
+                    "capture_current_lap": self.capture_current_lap,
+                    "active_lap_number": self.active_lap_number, "sample_count": len(self.active_samples),
+                },
+                "flags": flags, "decision": decision, "reasons": reasons,
+            })
 
     def record_telemetry(self, telemetry: dict[str, Any], session_time: float, session_uid: int | None = None) -> None:
         with self.lock:
@@ -495,17 +797,22 @@ class SessionStore:
             self.latest.update(sample)
             self._touch()
 
-    def _finish_lap(self, time_ms: int) -> None:
-        if self.active_recording_id is None or time_ms < 30_000 or len(self.active_samples) < 30:
-            return
+    def _finish_lap(self, time_ms: int) -> tuple[bool, str]:
+        if self.active_recording_id is None:
+            return False, "finish_rejected_no_active_recording"
+        if time_ms < 30_000:
+            return False, "finish_rejected_official_time_below_30000_ms"
+        if len(self.active_samples) < 30:
+            return False, "finish_rejected_fewer_than_30_samples"
         session = self.sessions[self.active_recording_id]
         if session.game_session_uid != self.game_session_uid:
-            return
+            return False, "finish_rejected_game_session_uid_mismatch"
         state = self.active_lap_state
         saved_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         lap = enrich_lap(Lap(
             number=self.active_lap_number or 0, time_ms=time_ms, invalid=self.active_invalid,
-            samples=self.active_samples, setup=self.active_lap_setup, saved_at=saved_at,
+            samples=self.active_samples, events=self.active_lap_events,
+            setup=self.active_lap_setup, saved_at=saved_at,
             sector1_ms=_positive(state.get("sector1_ms")), sector2_ms=_positive(state.get("sector2_ms")),
             recording_session_id=session.id, game_session_uid=session.game_session_uid,
             mode=session.mode, track_id=session.track_id, track_length_m=session.track_length_m,
@@ -519,6 +826,7 @@ class SessionStore:
         self._atomic_json(directory / f"{lap.id}.json", payload, compact=True)
         self._persist_session(session)
         self.pb_registry.consider(lap, session.name, self.notes.get(lap.id, ""))
+        return True, "finish_saved_official_time_and_minimum_samples_present"
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -542,6 +850,7 @@ class SessionStore:
                 "recording": recording,
                 "selected_session_id": self.selected_session_id,
                 "selected_is_active": bool(active and selected and active.id == selected.id),
+                "diagnostics": self.diagnostic_status(),
             }
 
     def list_laps(self, session_id: str | None = None) -> list[dict[str, Any]]:
@@ -747,7 +1056,11 @@ class UdpReceiver(Thread):
         elif header.packet_id == PACKET_LAP_DATA:
             lap_state = decode_player_lap_data(data, header)
             if lap_state:
-                self.store.record_lap_state(lap_state, header.session_uid)
+                self.store.record_lap_state(lap_state, header.session_uid, {
+                    "session_time": round(header.session_time, 6),
+                    "frame_identifier": header.frame_identifier,
+                    "overall_frame_identifier": header.overall_frame_identifier,
+                })
         elif header.packet_id == PACKET_CAR_TELEMETRY:
             telemetry = decode_player_car_telemetry(data, header)
             if telemetry:

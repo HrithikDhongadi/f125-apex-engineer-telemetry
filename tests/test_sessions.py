@@ -3,6 +3,7 @@ from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from src.f1telemetry.receiver import LEGACY_SESSION_ID, SessionStore, UdpReceiver
 
@@ -17,10 +18,11 @@ def game(uid=UID, mode="time_trial", track_id=7, track_length=5891):
     }
 
 
-def lap_state(number, current_ms=0, distance=0, last_ms=0, invalid=False):
+def lap_state(number, current_ms=0, distance=0, last_ms=0, invalid=False, total_distance=None):
     return {
         "lap_number": number, "last_lap_ms": last_ms, "current_lap_ms": current_ms,
-        "lap_distance_m": distance, "invalid": invalid, "sector1_ms": 28_000,
+        "lap_distance_m": distance, "total_distance_m": distance if total_distance is None else total_distance,
+        "invalid": invalid, "sector1_ms": 28_000,
         "sector2_ms": 39_000,
     }
 
@@ -42,6 +44,197 @@ def fill_lap(store, uid, number, time_ms=90_000):
 
 
 class RecordingSessionTests(unittest.TestCase):
+    def test_opt_in_diagnostic_records_staggered_boundary_decisions(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            self.assertFalse(store.configure_diagnostics(True)["active_file"])
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(23, 89_000, 5_885), UID)
+            run = store.start_time_trial_run("diagnostic reproduction")
+
+            # Reproduce the suspected ordering without changing recorder logic:
+            # lap number advances while time/distance still describe the old lap,
+            # then time/distance reset on a same-number packet.
+            store.record_lap_state(lap_state(24, 89_020, 5_889, 88_900, total_distance=176_718.05), UID, {
+                "session_time": 4_000.0, "frame_identifier": 100,
+                "overall_frame_identifier": 200,
+            })
+            store.record_lap_state(lap_state(24, 16, 1.2, 88_900, total_distance=176_721.52), UID, {
+                "session_time": 4_000.05, "frame_identifier": 101,
+                "overall_frame_identifier": 201,
+            })
+
+            diagnostic_dir = root / "sessions" / run["id"] / "diagnostics"
+            decisions = [
+                json.loads(row) for row in
+                (diagnostic_dir / "lap-data-00-run-start.jsonl").read_text().splitlines()
+                if json.loads(row).get("event") == "lap_data_decision"
+            ]
+            first, second = decisions[-2:]
+            self.assertEqual(first["decision"], "rejected_crossing")
+            self.assertIn("rejected_crossing_lap_number_advanced_but_time_or_distance_not_near_line", first["reasons"])
+            self.assertEqual(first["previous_packet"]["lap_number"], 23)
+            self.assertEqual(first["packet"]["lap_number"], 24)
+            self.assertEqual(first["frame_identifier"], 100)
+            self.assertEqual(first["overall_frame_identifier"], 200)
+            self.assertEqual(first["before"]["recording_status"], "armed")
+            self.assertFalse(first["after"]["capture_current_lap"])
+            self.assertEqual(second["packet"]["total_distance_m"], 176_721.52)
+            self.assertEqual(second["decision"], "start_capture")
+            self.assertIn("verified_start_same_number_wrap", second["reasons"])
+            self.assertEqual(store.sessions[run["id"]].status, "recording")
+
+    def test_live_zero_timer_same_number_sequence_saves_first_and_following_laps(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(track_length=5_890))
+
+            # Replay the decisive packets from session-20261004T132600-dbdce8e9.
+            # F1 25 called the untimed approach lap 31 and held its timer at
+            # zero, then crossed the line without changing the lap number.
+            store.record_lap_state(
+                lap_state(31, 0, 130.77, 88_741, total_distance=170_960.30), UID,
+                {"session_time": 5_463.186523, "frame_identifier": 109_838,
+                 "overall_frame_identifier": 110_159},
+            )
+            run = store.start_time_trial_run("live sequence replay")
+            self.assertEqual(store.sessions[run["id"]].status, "armed")
+            store.record_lap_state(
+                lap_state(31, 0, 5_888.52, 88_741, total_distance=176_718.05), UID,
+                {"session_time": 5_489.737793, "frame_identifier": 110_372,
+                 "overall_frame_identifier": 110_693},
+            )
+            store.record_lap_state(
+                lap_state(31, 16, 1.32, 88_741, total_distance=176_721.52), UID,
+                {"session_time": 5_489.787598, "frame_identifier": 110_373,
+                 "overall_frame_identifier": 110_694},
+            )
+            self.assertEqual(store.sessions[run["id"]].status, "recording")
+            self.assertTrue(store.capture_current_lap)
+            self.assertEqual(store.active_lap_number, 31)
+
+            lap31_start_total = 176_721.52
+            for index in range(40):
+                progress = index / 39
+                current = int(16 + progress * (89_024 - 16))
+                distance = 1.32 + progress * (5_887.82 - 1.32)
+                store.record_lap_state(lap_state(
+                    31, current, distance, 88_741,
+                    total_distance=lap31_start_total + distance - 1.32,
+                ), UID)
+                store.record_telemetry(telemetry(180 + index), 5_489.788 + current / 1_000, UID)
+            store.record_lap_state(
+                lap_state(32, 0, 0.5, 89_064, total_distance=182_611.38), UID
+            )
+
+            lap32_start_total = 182_611.38
+            for index in range(40):
+                progress = index / 39
+                current = int(progress * 89_160)
+                distance = 0.5 + progress * (5_888.6 - 0.5)
+                store.record_lap_state(lap_state(
+                    32, current, distance, 89_064,
+                    total_distance=lap32_start_total + distance - 0.5,
+                ), UID)
+                store.record_telemetry(telemetry(185 + index), 5_578.843 + current / 1_000, UID)
+            store.record_lap_state(
+                lap_state(33, 0, 0.6, 89_192, total_distance=188_502.8), UID
+            )
+
+            recorded = store.session_laps[run["id"]]
+            self.assertEqual([lap.number for lap in recorded], [31, 32])
+            self.assertEqual([lap.time_ms for lap in recorded], [89_064, 89_192])
+            for lap in recorded:
+                self.assertLessEqual(lap.samples[0]["lap_distance_m"], 1.32)
+                self.assertGreaterEqual(lap.samples[-1]["lap_distance_m"], 5_887.82)
+
+    def test_live_zero_to_zero_timer_wrap_starts_first_lap_40(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(track_length=5_890))
+            store.record_lap_state(lap_state(
+                40, 0, 5_888.40, 89_021, total_distance=229_733.98,
+            ), UID)
+            run = store.start_time_trial_run("live lap 40 replay")
+            store.record_lap_state(lap_state(
+                40, 0, 1.08, 89_021, total_distance=229_737.34,
+            ), UID, {"session_time": 7_217.525879, "frame_identifier": 145_222})
+            self.assertEqual(store.sessions[run["id"]].status, "recording")
+            self.assertTrue(store.capture_current_lap)
+            self.assertEqual(store.active_lap_number, 40)
+
+            for index in range(40):
+                progress = index / 39
+                store.record_lap_state(lap_state(
+                    40, int(progress * 91_188), 1.08 + progress * (5_887.4 - 1.08),
+                    invalid=True, total_distance=229_737.34 + progress * 5_886.32,
+                ), UID)
+                store.record_telemetry(telemetry(), 7_217.526 + progress * 91.188, UID)
+            store.record_lap_state(lap_state(
+                41, 0, 0.18, 91_238, total_distance=235_627.11,
+            ), UID)
+
+            captured = store.session_laps[run["id"]]
+            self.assertEqual([lap.number for lap in captured], [40])
+            self.assertEqual(captured[0].time_ms, 91_238)
+            self.assertTrue(captured[0].invalid)
+
+    def test_zero_timer_same_number_rewind_to_start_begins_restarted_lap(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(track_length=5_890))
+            store.record_lap_state(
+                lap_state(31, 0, 5_888.52, total_distance=176_718.05), UID
+            )
+            run = store.start_time_trial_run("flashback guard")
+
+            # Backward total distance proves this is not a natural crossing,
+            # but landing just after the line is a clean restarted-lap start.
+            store.record_lap_state(
+                lap_state(31, 16, 1.32, total_distance=170_831.0), UID
+            )
+            self.assertEqual(store.sessions[run["id"]].status, "recording")
+            self.assertTrue(store.capture_current_lap)
+            self.assertEqual(store.active_lap_events[0]["type"], "restart_lap")
+            self.assertEqual(store.session_laps[run["id"]], [])
+
+    def test_diagnostic_is_opt_in_bounded_and_restart_uses_separate_segment(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(8), UID)
+            run = store.start_time_trial_run("no diagnostic")
+            self.assertFalse((root / "sessions" / run["id"] / "diagnostics").exists())
+            store.stop_recording()
+
+            store.configure_diagnostics(True)
+            second = store.start_time_trial_run("diagnostic restart")
+            store.record_lap_state(lap_state(9, 30_000, 2_000), UID)
+            store.record_lap_state(lap_state(8, 0, -50), UID)
+            diagnostic_dir = root / "sessions" / second["id"] / "diagnostics"
+            self.assertTrue((diagnostic_dir / "lap-data-00-run-start.jsonl").exists())
+            restart_path = diagnostic_dir / "lap-data-01-restart-lap.jsonl"
+            self.assertTrue(restart_path.exists())
+            restart = json.loads(restart_path.read_text().splitlines()[0])
+            self.assertEqual(restart["decision"], "discard_partial_lap")
+            self.assertIn("discard_lap_number_decreased_probable_restart_or_flashback", restart["reasons"])
+
+        with TemporaryDirectory() as directory, patch("src.f1telemetry.receiver.MAX_DIAGNOSTIC_EVENTS", 2):
+            root = Path(directory)
+            store = SessionStore(root)
+            store.configure_diagnostics(True)
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(1, 20_000, 1_000), UID)
+            store.start_time_trial_run("bounded")
+            store.record_lap_state(lap_state(1, 20_050, 1_003), UID)
+            store.record_lap_state(lap_state(1, 20_100, 1_006), UID)
+            status = store.snapshot()["diagnostics"]
+            self.assertTrue(status["truncated"])
+            rows = (root / status["active_file"]).read_text().splitlines()
+            self.assertEqual(json.loads(rows[-1])["event"], "diagnostic_limit_reached")
+
     def test_time_trial_start_mid_lap_arms_until_next_full_lap(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
@@ -261,24 +454,168 @@ class RecordingSessionTests(unittest.TestCase):
             recorded = store.session_laps[run["id"]]
             self.assertEqual([lap.number for lap in recorded], [8, 9])
             restarted = recorded[-1]
+            self.assertEqual(restarted.events[0]["type"], "restart_lap")
             distances = [sample["lap_distance_m"] for sample in restarted.samples]
             self.assertLessEqual(min(distances), 5)
             self.assertGreater(max(distances), 5_800)
             self.assertNotIn(90, [sample["speed_kph"] for sample in restarted.samples])
 
-    def test_midlap_flashback_discards_lap_until_next_crossing(self):
+    def test_midlap_flashback_prunes_superseded_branch_and_saves_invalid_lap(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
             store.record_game_session(game())
             store.record_lap_state(lap_state(3), UID)
             run = store.start_time_trial_run("flashback")
             for index in range(30):
-                store.record_lap_state(lap_state(3, 20_000 + index * 500, 1500 + index * 20), UID)
-                store.record_telemetry(telemetry(), index, UID)
-            store.record_lap_state(lap_state(3, 15_000, 1100), UID)
-            store.record_lap_state(lap_state(4, 0, 0, 90_000), UID)
+                store.record_lap_state(lap_state(3, index * 1_500, index * 100, invalid=index > 20), UID)
+                store.record_telemetry(telemetry(90), index, UID)
+            # Exact rewind observed on live lap 35: frame 122938 replaced the
+            # future branch ending at 46.327 s / 2,852.61 m.
+            store.record_lap_state(lap_state(3, 46_327, 2_852.61, invalid=True), UID)
+            store.record_telemetry(telemetry(90), 30, UID)
+            store.record_lap_state(lap_state(3, 33_549, 2_113.72, invalid=True), UID, {
+                "session_time": 6_114.949219, "frame_identifier": 122_938,
+            })
+            self.assertTrue(store.capture_current_lap)
+            self.assertTrue(store.active_samples)
+            self.assertLessEqual(max(sample["lap_distance_m"] for sample in store.active_samples), 2_113.72)
+            for index in range(40):
+                progress = index / 39
+                current = int(33_549 + progress * (92_168 - 33_549))
+                distance = 2_113.72 + progress * (5_889.42 - 2_113.72)
+                store.record_lap_state(lap_state(3, current, distance, invalid=True), UID)
+                store.record_telemetry(telemetry(180 + index), 46 + index, UID)
+            store.record_lap_state(lap_state(4, 16, 2.17, 92_192), UID)
             fill_lap(store, UID, 4)
-            self.assertEqual([lap.number for lap in store.session_laps[run["id"]]], [4])
+
+            recorded = store.session_laps[run["id"]]
+            self.assertEqual([lap.number for lap in recorded], [3, 4])
+            flashed = recorded[0]
+            self.assertEqual(flashed.time_ms, 92_192)
+            self.assertTrue(flashed.invalid)
+            self.assertEqual(flashed.events[0]["type"], "flashback")
+            self.assertGreater(flashed.events[0]["pruned_sample_count"], 0)
+            distances = [sample["lap_distance_m"] for sample in flashed.samples]
+            lap_times = [sample["current_lap_ms"] for sample in flashed.samples]
+            self.assertTrue(all(b >= a for a, b in zip(distances, distances[1:])))
+            self.assertTrue(all(b >= a for a, b in zip(lap_times, lap_times[1:])))
+
+    def test_race_flashback_lap_uses_game_validity_and_is_saved(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="race"))
+            run_id = store.active_recording_id
+            store.record_lap_state(lap_state(4, 89_000, 5_880), UID)
+            store.record_lap_state(lap_state(5), UID)
+            for index in range(30):
+                store.record_lap_state(lap_state(5, index * 1_000, index * 80), UID)
+                store.record_telemetry(telemetry(), index, UID)
+            store.record_lap_state(lap_state(5, 15_000, 1_200, invalid=False), UID)
+            for index in range(40):
+                progress = index / 39
+                store.record_lap_state(lap_state(
+                    5, int(15_000 + progress * 75_000), 1_200 + progress * 4_680,
+                    invalid=False,
+                ), UID)
+                store.record_telemetry(telemetry(), 31 + index, UID)
+            store.record_lap_state(lap_state(6, 0, 0, 90_000, invalid=False), UID)
+
+            raced = store.session_laps[run_id][0]
+            self.assertFalse(raced.invalid)
+            self.assertEqual(raced.events[0]["type"], "flashback")
+
+    def test_restart_reset_at_start_immediately_recaptures_same_lap_number(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(38), UID)
+            run = store.start_time_trial_run("restart at line")
+            for index in range(30):
+                store.record_lap_state(lap_state(38, index * 1_500, index * 100), UID)
+                store.record_telemetry(telemetry(90), index, UID)
+
+            # F1 25 can place the car directly at/just after the line without
+            # emitting a separate negative-distance crossing packet.
+            store.record_lap_state(lap_state(
+                38, 0, 0.5, 0, total_distance=0.5,
+            ), UID, {"session_time": 45.0, "frame_identifier": 1_000})
+            self.assertTrue(store.capture_current_lap)
+            self.assertEqual(store.active_lap_number, 38)
+            self.assertEqual(store.active_samples, [])
+            self.assertEqual(store.active_lap_events[0]["type"], "restart_lap")
+
+            for index in range(40):
+                progress = index / 39
+                store.record_lap_state(lap_state(
+                    38, int(progress * 90_000), 0.5 + progress * 5_879.5,
+                    invalid=False, total_distance=0.5 + progress * 5_879.5,
+                ), UID)
+                store.record_telemetry(telemetry(180 + index), 46 + index, UID)
+            store.record_lap_state(lap_state(39, 0, 0, 90_000), UID)
+
+            restarted = store.session_laps[run["id"]][0]
+            self.assertEqual(restarted.number, 38)
+            self.assertEqual(restarted.events[0]["type"], "restart_lap")
+            self.assertNotIn(90, [sample["speed_kph"] for sample in restarted.samples])
+
+    def test_live_restart_relocation_saves_only_the_real_restarted_lap_42(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(track_length=5_890))
+            store.record_lap_state(lap_state(42), UID)
+            run = store.start_time_trial_run("live restart relocation replay")
+
+            for index in range(40):
+                progress = index / 39
+                store.record_lap_state(lap_state(
+                    42, int(progress * 20_053), progress * 1_178.81,
+                    total_distance=241_518.30 + progress * 1_178.12,
+                ), UID)
+                store.record_telemetry(telemetry(90), 7_399.907 + progress * 20.053, UID)
+
+            # Exact two-packet Restart Lap transition from the live run: the
+            # timer resets first, then total distance reveals the relocation
+            # to an untimed approach even though lap distance moves forward.
+            store.record_lap_state(lap_state(
+                42, 0, 1_180.91, 91_132, total_distance=242_698.52,
+            ), UID, {"session_time": 7_420.009766, "frame_identifier": 149_276})
+            store.record_lap_state(lap_state(
+                42, 0, 4_823.54, 91_132, total_distance=240_450.47,
+            ), UID, {"session_time": 7_420.060059, "frame_identifier": 149_277})
+            self.assertFalse(store.capture_current_lap)
+            self.assertEqual(store.active_samples, [])
+            self.assertEqual(store.pending_restart_event["type"], "restart_lap")
+
+            for index in range(20):
+                progress = index / 19
+                store.record_lap_state(lap_state(
+                    42, 0, 4_823.54 + progress * (5_890.39 - 4_823.54), 91_132,
+                    total_distance=240_450.47 + progress * (241_517.33 - 240_450.47),
+                ), UID)
+                store.record_telemetry(telemetry(95), 7_420.06 + index, UID)
+            store.record_lap_state(lap_state(
+                42, 33, 3.17, 91_132, total_distance=241_520.78,
+            ), UID, {"session_time": 7_438.961914, "frame_identifier": 149_659})
+            self.assertTrue(store.capture_current_lap)
+            self.assertEqual(store.session_laps[run["id"]], [])
+
+            for index in range(40):
+                progress = index / 39
+                store.record_lap_state(lap_state(
+                    42, int(33 + progress * (89_430 - 33)), 3.17 + progress * (5_890.47 - 3.17),
+                    total_distance=241_520.78 + progress * (247_408.08 - 241_520.78),
+                ), UID)
+                store.record_telemetry(telemetry(180 + index), 7_438.962 + progress * 89.405, UID)
+            store.record_lap_state(lap_state(
+                43, 33, 3.28, 89_441, total_distance=247_411.56,
+            ), UID)
+
+            captured = store.session_laps[run["id"]]
+            self.assertEqual([lap.number for lap in captured], [42])
+            self.assertEqual(captured[0].time_ms, 89_441)
+            self.assertEqual(captured[0].events[0]["type"], "restart_lap")
+            self.assertGreaterEqual(captured[0].samples[-1]["lap_distance_m"], 5_890)
+            self.assertNotIn(90, [sample["speed_kph"] for sample in captured[0].samples])
 
     def test_start_before_first_lap_packet_cannot_save_partial_lap(self):
         with TemporaryDirectory() as directory:

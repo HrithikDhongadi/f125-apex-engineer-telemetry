@@ -27,7 +27,9 @@
           <button id="start-run" class="primary" hidden>Start new run</button>
           <button id="stop-recording" class="danger" hidden>Stop recording</button>
           <button id="jump-active" hidden>Jump to active session</button>
+          <label class="diagnostic-toggle"><input id="diagnostic-enabled" type="checkbox"> Capture lap-boundary diagnostics</label>
         </div>
+        <p id="diagnostic-status" class="hint">Diagnostics are off.</p>
         <p id="recording-message" class="error" role="alert"></p>
         <div class="displayed-session">
           <label for="session-select">Displayed session</label>

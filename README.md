@@ -39,9 +39,17 @@ Packet ID `5` is decoded using the complete packed 50-byte `CarSetupData` stride
 5. Select **Stop recording** when the run is finished. Completed laps remain saved; only the current incomplete lap is discarded.
 6. Start another named run under the same in-game Time Trial session whenever required.
 
-**Restart Lap and flashbacks:** an abandoned partial lap is discarded. Crossing the line after Restart Lap starts a clean capture even when the game reports `last_lap_ms = 0`; that zero prevents the abandoned lap from being saved but no longer prevents the new lap from being recorded. A run started before the first Lap Data packet remains armed until a verified start/finish crossing. Midlap time/distance rewinds and implausible midlap lap-number jumps do not create completed laps.
+**Restart Lap and flashbacks:** a mid-lap flashback no longer deletes the lap. Samples from the superseded future branch are pruned, recording continues from the rewound point, and the saved lap carries a flashback event plus the validity reported by the game. This keeps invalid Time Trial laps and permits race laps when the game allows them without duplicating distance in analysis. Restart Lap discards only the abandoned partial samples and begins a clean capture at the reset/crossing under the lap number reported by the game. F1 25 may relocate the car to an untimed approach where lap distance increases but total distance rewinds; that relocation is treated as Restart Lap rather than a completed lap. A run started before the first Lap Data packet remains armed until a verified start/finish crossing.
 
 **Why the first saved number can look skipped:** the game owns lap numbering; Apex Engineer never renumbers laps. For example, if a run is started just before the line while the HUD says lap 19, that lap-19 approach is only a partial lap and is excluded. When the HUD changes to lap 20 at the line, the recorder begins capturing lap 20 and saves it at the following crossing. Earlier laps may belong to another recording, so the new session correctly begins with a `lap-...-20.json` file and does not create a placeholder lap 19.
+
+F1 25 can also label an untimed approach with the *upcoming* lap number while holding its current-lap timer at zero. In the captured Silverstone reproduction, lap 31 stayed unchanged across the line while lap distance wrapped from 5,888.52 m to 1.32 m and total distance advanced by 3.47 m. Apex Engineer treats that continuous forward wrap as the verified start of lap 31. A distance rewind or flashback does not qualify because total distance must remain continuous across the line.
+
+### Opt-in lap-boundary diagnostics
+
+For an unexplained missing first lap, enable **Capture lap-boundary diagnostics** before selecting **Start new run**. Drive at least two complete laps and stop the recording. Player Lap Data and every recorder decision are written separately under that session's `diagnostics/` directory as bounded JSON Lines files; lap JSON, PBs, and reports are unaffected. Each entry includes reception timestamp, game session UID/time, both frame identifiers, current and previous lap values, track length, recorder status before/after, active/captured lap number, sample count, decision flags, and explicit accept/reject/discard/finish reasons.
+
+The initial segment captures the first few laps; up to seven additional rewind/Restart Lap segments are retained when those events occur. Each segment is capped at 50,000 events and 50 MiB. Diagnostics are deliberately opt-in because they perform a small append write for every player Lap Data packet. Disable the checkbox after the short reproduction run.
 
 ### Race
 
@@ -127,6 +135,7 @@ POST /api/sessions/<session_id>/rename  {"name":"rear wing +1"}
 POST /api/sessions/<session_id>/track-name {"name":"Local circuit"}
 POST /api/runs/start                     {"name":"18/18 baseline"}
 POST /api/recording/stop
+POST /api/diagnostics                    {"enabled":true}
 GET  /api/laps[?session=<session_id>]
 GET  /api/laps/<lap_id>
 POST /api/laps/<lap_id>/note             {"note":"Stowe test"}
@@ -151,4 +160,4 @@ python3 -m py_compile src/f1telemetry/*.py
 
 - Race-strategy prediction is not implemented.
 - Live fuel burn, ERS, tyre wear/damage, tyre compound/age, gaps, positions, and pit windows await future packet decoders. Configured setup fuel load is decoded.
-- Restart Lap and flashback transitions are covered by synthetic regression tests, but real F1 25 driving is still required to confirm every packet-ordering variation and game mode.
+- Restart Lap and flashback transitions are covered by synthetic regression tests. A live Silverstone Time Trial trace also covers the same-number, zero-timer approach transition that previously lost the first complete lap; other game modes and packet-ordering variations still require live confirmation.

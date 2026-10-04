@@ -7,19 +7,24 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import socket
+import sqlite3
 from threading import Event, Lock, Thread
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
 from .circuits import is_known_track, track_name
+from .circuit_profiles import CircuitProfileStore, profile_identity
 from .protocol import (
-    PACKET_CAR_SETUPS, PACKET_CAR_TELEMETRY, PACKET_EVENT, PACKET_LAP_DATA,
-    PACKET_SESSION, decode_event_code, decode_header, decode_player_car_telemetry,
-    decode_player_lap_data, decode_player_setup, decode_session,
+    PACKET_CAR_DAMAGE, PACKET_CAR_SETUPS, PACKET_CAR_STATUS, PACKET_CAR_TELEMETRY,
+    PACKET_EVENT, PACKET_FINAL_CLASSIFICATION, PACKET_LAP_DATA, PACKET_MOTION,
+    PACKET_MOTION_EX, PACKET_SESSION, decode_event, decode_event_code, decode_header,
+    decode_packet, decode_player_car_telemetry, decode_player_lap_data, decode_player_setup,
+    decode_session, supported_header,
 )
 from .personal_bests import PersonalBestRegistry
 from .quality import lap_quality
+from .race_store import RaceSessionStore
 from .setups import SetupValidationError, setup_rows, validate_manual_values, with_provenance
 
 LEGACY_SESSION_ID = "legacy"
@@ -55,6 +60,7 @@ class Lap:
     mode: str = "unknown"
     track_id: int | None = None
     track_length_m: int | None = None
+    race_context: dict[str, Any] | None = None
 
     @property
     def id(self) -> str:
@@ -93,6 +99,11 @@ class RecordingSession:
     track_length_m: int | None
     lap_ids: list[str] = field(default_factory=list)
     track_name_override: str | None = None
+    packet_format: int = 2025
+    sector2_start_m: float | None = None
+    sector3_start_m: float | None = None
+    circuit_profile_id: str | None = None
+    race_store_file: str | None = None
 
     def summary(self, laps: list[Lap]) -> dict[str, Any]:
         valid = [lap.time_ms for lap in laps if not lap.invalid]
@@ -149,6 +160,7 @@ class SessionStore:
         self.sessions_dir.mkdir(exist_ok=True)
         self.notes_path = self.capture_dir / "notes.json"
         self.pb_registry = PersonalBestRegistry(self.capture_dir / "personal_bests")
+        self.profile_store = CircuitProfileStore(self.capture_dir / "circuit_profiles")
         self.lock = Lock()
         self.latest: dict[str, Any] = {"connected": False}
         self.last_packet_at: float | None = None
@@ -161,6 +173,8 @@ class SessionStore:
         self.game_session_type: int | None = None
         self.track_id: int | None = None
         self.track_length_m: int | None = None
+        self.sector2_start_m: float | None = None
+        self.sector3_start_m: float | None = None
         self.active_recording_id: str | None = None
         self.selected_session_id: str | None = None
         self.manual_stop_uid: int | None = None
@@ -173,6 +187,9 @@ class SessionStore:
         self.active_lap_state: dict[str, Any] = {}
         self.active_lap_setup: dict[str, Any] | None = None
         self.capture_current_lap = False
+        self.race_store: RaceSessionStore | None = None
+        self.packet_state: dict[int, dict[str, Any]] = {}
+        self.active_lap_context: dict[str, Any] | None = None
         self.diagnostics_enabled = False
         self.diagnostic_path: Path | None = None
         self.diagnostic_segment = -1
@@ -267,6 +284,8 @@ class SessionStore:
         self.game_session_uid = session_uid
         self.game_mode, self.game_session_type = "unknown", None
         self.track_id, self.track_length_m = None, None
+        self.sector2_start_m, self.sector3_start_m = None, None
+        self.packet_state = {}
         self.current_setup = None
         self.manual_stop_uid = None
         for key in (
@@ -283,6 +302,8 @@ class SessionStore:
             self.game_session_type = int(game["session_type"])
             self.track_id = int(game["track_id"])
             self.track_length_m = int(game["track_length_m"])
+            self.sector2_start_m = float(game["sector2_start_m"]) if game.get("sector2_start_m") is not None else None
+            self.sector3_start_m = float(game["sector3_start_m"]) if game.get("sector3_start_m") is not None else None
             self.latest.update({
                 "game_session_uid": self.game_session_uid, "game_mode": self.game_mode,
                 "session_type": self.game_session_type, "track_id": self.track_id,
@@ -319,6 +340,9 @@ class SessionStore:
             ended_at=None, status="recording" if at_start else "armed",
             game_session_uid=self.game_session_uid, track_id=self.track_id,
             track_length_m=self.track_length_m, lap_ids=[],
+            sector2_start_m=self.sector2_start_m, sector3_start_m=self.sector3_start_m,
+            circuit_profile_id=(profile_identity(2025, self.track_id) if self.track_id is not None else None),
+            race_store_file="race-data.sqlite3",
         )
         self.sessions[session.id], self.session_laps[session.id] = session, []
         self.active_recording_id = session.id
@@ -334,6 +358,15 @@ class SessionStore:
             self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
             self.active_invalid = bool(self.active_lap_state.get("invalid", False))
         self._persist_session(session)
+        self.race_store = RaceSessionStore(self.sessions_dir / session.id / "race-data.sqlite3")
+        self.race_store.set_metadata("recording_session_id", session.id)
+        self.race_store.set_metadata("mode", session.mode)
+        self.race_store.set_metadata("track_id", session.track_id)
+        self.race_store.append_event(
+            float(self.active_lap_state.get("session_time", 0) or 0), "recording_started",
+            {"status": session.status, "capture_current_lap": self.capture_current_lap},
+            "recorder", self.active_lap_number,
+        )
         if self.diagnostics_enabled:
             self.diagnostic_path = None
             self.diagnostic_segment = -1
@@ -451,6 +484,17 @@ class SessionStore:
             return
         session = self.sessions[self.active_recording_id]
         session.status, session.ended_at = status, utc_now()
+        if self.race_store is not None:
+            if self.active_lap_number is not None:
+                self.race_store.append_event(
+                    float(self.latest.get("t", 0) or 0), "recording_closed_with_incomplete_lap",
+                    {"status": status, "samples_in_lap_json_buffer": len(self.active_samples), "capture_current_lap": self.capture_current_lap},
+                    "recorder", self.active_lap_number,
+                )
+            self.race_store.set_metadata("ended_at", session.ended_at)
+            self.race_store.set_metadata("status", status)
+            self.race_store.close()
+            self.race_store = None
         self._persist_session(session)
         self.active_recording_id = None
         self.capture_current_lap = False
@@ -519,6 +563,7 @@ class SessionStore:
         self.pending_restart_event = None
         self.active_lap_state = {}
         self.active_lap_setup = None
+        self.active_lap_context = None
         self.capture_current_lap = False
 
     def _begin_lap(self, lap_number: int, capture: bool) -> None:
@@ -528,7 +573,18 @@ class SessionStore:
         self.active_lap_events = []
         self.active_lap_state = {}
         self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
+        self.active_lap_context = self._current_race_context()
         self.capture_current_lap = capture
+
+    def _current_race_context(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for packet_id, label in ((PACKET_SESSION, "session"), (PACKET_LAP_DATA, "lap"), (PACKET_CAR_STATUS, "car_status"), (PACKET_CAR_DAMAGE, "damage")):
+            payload = self.packet_state.get(packet_id)
+            if not isinstance(payload, dict):
+                continue
+            player = payload.get("player")
+            result[label] = dict(player) if isinstance(player, dict) else dict(payload)
+        return result
 
     def record_lap_state(
         self,
@@ -753,6 +809,10 @@ class SessionStore:
                             ]
                             removed = len(self.active_samples) - len(retained)
                             self.active_samples = retained
+                            # A flashback creates a new game timeline. Validity
+                            # follows the current game flag on that timeline;
+                            # the recorder never invents invalidity.
+                            self.active_invalid = False
                             self.active_lap_events.append({
                                 "type": "flashback", "session_time": (packet_meta or {}).get("session_time"),
                                 "frame_identifier": (packet_meta or {}).get("frame_identifier"),
@@ -782,6 +842,12 @@ class SessionStore:
             self.latest.update(lap_state)
             self._touch()
             active_session = self.sessions.get(self.active_recording_id or "")
+            if self.race_store is not None and decision not in {"observe", "continue_capture", "continue_not_capturing"}:
+                self.race_store.append_event(
+                    float((packet_meta or {}).get("session_time") or 0), decision,
+                    {"reasons": reasons, "flags": flags, "packet": dict(lap_state)},
+                    "recorder", lap_number,
+                )
             self._write_diagnostic({
                 "event": "lap_data_decision", "timestamp_utc": self._diagnostic_timestamp(),
                 "session_uid": session_uid,
@@ -808,12 +874,80 @@ class SessionStore:
             self._observe_uid(session_uid)
             sample = {
                 "t": round(session_time, 3), "lap_distance_m": self.active_lap_state.get("lap_distance_m"),
-                "current_lap_ms": self.active_lap_state.get("current_lap_ms"), **telemetry,
+                "current_lap_ms": self.active_lap_state.get("current_lap_ms"),
+                "pit_status": self.active_lap_state.get("pit_status"), **telemetry,
             }
+            motion = self.packet_state.get(PACKET_MOTION, {}).get("player")
+            motion_ex = self.packet_state.get(PACKET_MOTION_EX)
+            if isinstance(motion, dict):
+                sample.update({key: motion.get(key) for key in ("world_x", "world_y", "world_z", "yaw", "g_lateral", "g_longitudinal")})
+            if isinstance(motion_ex, dict):
+                sample.update({key: motion_ex.get(key) for key in ("wheel_slip_ratio", "wheel_slip_angle", "front_wheels_angle", "chassis_yaw")})
+                slip_ratio = motion_ex.get("wheel_slip_ratio")
+                slip_angle = motion_ex.get("wheel_slip_angle")
+                if isinstance(slip_ratio, list) and len(slip_ratio) == 4:
+                    sample["front_wheel_slip_ratio"] = sum(abs(float(value)) for value in slip_ratio[2:4]) / 2
+                    sample["rear_wheel_slip_ratio"] = sum(abs(float(value)) for value in slip_ratio[0:2]) / 2
+                if isinstance(slip_angle, list) and len(slip_angle) == 4:
+                    sample["front_wheel_slip_angle"] = sum(abs(float(value)) for value in slip_angle[2:4]) / 2
+                    sample["rear_wheel_slip_angle"] = sum(abs(float(value)) for value in slip_angle[0:2]) / 2
             if self.capture_current_lap and self.active_lap_number is not None:
                 self.active_samples.append(sample)
             self.latest.update(sample)
             self._touch()
+
+    def record_full_packet(self, header: Any, payload: dict[str, Any]) -> None:
+        """Persist and correlate a decoded packet without changing lap-boundary logic."""
+        with self.lock:
+            self._observe_uid(int(header.session_uid))
+            previous = self.packet_state.get(int(header.packet_id))
+            self.packet_state[int(header.packet_id)] = payload
+            if self.capture_current_lap and int(self.active_lap_state.get("current_lap_ms", 9_999_999)) <= 1_500:
+                self.active_lap_context = self._current_race_context()
+            player = payload.get("player") if isinstance(payload, dict) else None
+            distance = player.get("lap_distance_m") if isinstance(player, dict) else self.active_lap_state.get("lap_distance_m")
+            if self.race_store is None:
+                return
+            self.race_store.append_packet(header, payload, distance if isinstance(distance, (int, float)) else None)
+            lap_number = int(self.active_lap_state.get("lap_number", 0)) or None
+            if header.packet_id == PACKET_EVENT:
+                code = str(payload.get("code", "event"))
+                event_names = {
+                    "SSTA": "session_started", "SEND": "session_ended", "FTLP": "fastest_lap",
+                    "RTMT": "retirement", "DRSE": "drs_enabled", "DRSD": "drs_disabled",
+                    "TMPT": "team_mate_in_pits", "CHQF": "chequered_flag", "RCWN": "race_winner",
+                    "PENA": "penalty", "SPTP": "speed_trap", "STLG": "start_lights",
+                    "LGOT": "lights_out", "DTSV": "drive_through_served", "SGSV": "stop_go_served",
+                    "FLBK": "flashback", "RDFL": "red_flag", "OVTK": "overtake",
+                    "SCAR": "safety_car", "COLL": "collision",
+                }
+                self.race_store.append_event(header.session_time, event_names.get(code, code.lower()), payload, "udp_event", lap_number)
+            elif header.packet_id == PACKET_LAP_DATA and isinstance(player, dict):
+                old_player = previous.get("player") if isinstance(previous, dict) else None
+                if isinstance(old_player, dict):
+                    for key, event_type in (("pit_status", "pit_status_change"), ("position", "position_change")):
+                        if old_player.get(key) != player.get(key):
+                            if key == "pit_status":
+                                event_type = "pit_exit" if player.get(key) == 0 else "pit_entry" if old_player.get(key) == 0 else "pit_lane_state_change"
+                            self.race_store.append_event(header.session_time, event_type, {"from": old_player.get(key), "to": player.get(key)}, "inferred", player.get("lap_number"))
+                    if not old_player.get("pit_stop_time_ms") and player.get("pit_stop_time_ms"):
+                        self.race_store.append_event(header.session_time, "pit_stop", {"duration_ms": player.get("pit_stop_time_ms")}, "inferred", player.get("lap_number"))
+            elif header.packet_id == PACKET_CAR_STATUS and isinstance(player, dict):
+                old_player = previous.get("player") if isinstance(previous, dict) else None
+                if isinstance(old_player, dict) and old_player.get("actual_tyre_compound") != player.get("actual_tyre_compound"):
+                    self.race_store.append_event(header.session_time, "compound_change", {"from": old_player.get("actual_tyre_compound"), "to": player.get("actual_tyre_compound")}, "inferred", lap_number)
+            elif header.packet_id == PACKET_FINAL_CLASSIFICATION:
+                self.race_store.append_event(header.session_time, "final_classification", payload, "udp_event", lap_number)
+            elif header.packet_id == PACKET_SESSION and isinstance(previous, dict):
+                for key, event_type in (("safety_car_status", "safety_car_state_change"), ("weather", "weather_change")):
+                    if previous.get(key) != payload.get(key):
+                        self.race_store.append_event(header.session_time, event_type, {"from": previous.get(key), "to": payload.get(key)}, "inferred", lap_number)
+            elif header.packet_id == PACKET_CAR_DAMAGE and isinstance(player, dict):
+                old_player = previous.get("player") if isinstance(previous, dict) else None
+                if isinstance(old_player, dict) and old_player != player:
+                    changed = {key: {"from": old_player.get(key), "to": value} for key, value in player.items() if key != "car_index" and old_player.get(key) != value}
+                    if changed:
+                        self.race_store.append_event(header.session_time, "damage_change", changed, "inferred", lap_number)
 
     def _finish_lap(self, time_ms: int) -> tuple[bool, str]:
         if self.active_recording_id is None:
@@ -834,6 +968,7 @@ class SessionStore:
             sector1_ms=_positive(state.get("sector1_ms")), sector2_ms=_positive(state.get("sector2_ms")),
             recording_session_id=session.id, game_session_uid=session.game_session_uid,
             mode=session.mode, track_id=session.track_id, track_length_m=session.track_length_m,
+            race_context={"start": self.active_lap_context or {}, "finish": self._current_race_context()},
         ))
         self.session_laps[session.id].append(lap)
         session.lap_ids.append(lap.id)
@@ -851,7 +986,78 @@ class SessionStore:
             real = [session for session in self.sessions.values() if session.id != LEGACY_SESSION_ID]
             real.sort(key=lambda item: item.started_at, reverse=True)
             ordered = real + [self.sessions[LEGACY_SESSION_ID]]
-            return [session.summary(self.session_laps[session.id]) for session in ordered]
+            return [self._session_summary(session) for session in ordered]
+
+    def _session_summary(self, session: RecordingSession) -> dict[str, Any]:
+        result = session.summary(self.session_laps[session.id])
+        if session.id == self.active_recording_id and self.race_store is not None:
+            result["continuous_store"] = self.race_store.summary()
+        elif session.race_store_file:
+            path = self.sessions_dir / session.id / session.race_store_file
+            if path.exists():
+                try:
+                    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+                    packet_count = connection.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
+                    event_count = connection.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
+                    metadata = dict(connection.execute("SELECT key,value FROM metadata"))
+                    connection.close()
+                    result["continuous_store"] = {
+                        "path": session.race_store_file, "packet_count": packet_count, "event_count": event_count,
+                        "bytes": path.stat().st_size,
+                        "missing_frame_estimate": int(metadata.get("missing_frame_estimate", 0)),
+                        "dropped_packets": int(metadata.get("dropped_packets", 0)),
+                    }
+                except sqlite3.Error:
+                    result["continuous_store"] = {"path": session.race_store_file, "error": "unreadable"}
+        return result
+
+    def list_profiles(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        with self.lock:
+            session = self.sessions.get(session_id or self.selected_session_id or "")
+            return self.profile_store.list(2025, session.track_id) if session and session.track_id is not None else self.profile_store.list(2025)
+
+    def save_profile(self, payload: Any) -> dict[str, Any]:
+        with self.lock:
+            return self.profile_store.save(payload)
+
+    def select_profile(self, session_id: str, profile_id: str) -> dict[str, Any]:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            profile = self.profile_store.get(profile_id)
+            if session is None:
+                raise SessionStateError("Unknown session ID")
+            if profile is None:
+                raise SessionStateError("Unknown circuit profile")
+            if profile.get("packet_format") != session.packet_format or profile.get("track_id") != session.track_id:
+                raise SessionStateError("Circuit profile is incompatible with this session's format or track ID")
+            session.circuit_profile_id = profile_id
+            self._persist_session(session)
+            return self._session_summary(session)
+
+    def race_timeline(self, session_id: str, lap_from: int | None = None, lap_to: int | None = None) -> list[dict[str, Any]]:
+        with self.lock:
+            return self._race_timeline_unlocked(session_id, lap_from, lap_to)
+
+    def _race_timeline_unlocked(self, session_id: str, lap_from: int | None, lap_to: int | None) -> list[dict[str, Any]]:
+        session = self.sessions.get(session_id)
+        if session is None or not session.race_store_file:
+            raise SessionStateError("Continuous race data is unavailable for this session")
+        if session_id == self.active_recording_id and self.race_store is not None:
+            return self.race_store.timeline(lap_from, lap_to)
+        path = self.sessions_dir / session_id / session.race_store_file
+        if not path.exists():
+            raise SessionStateError("Continuous race data is unavailable for this legacy session")
+        return RaceSessionStore.read_timeline(path, lap_from, lap_to)
+
+    def _race_packet_export_unlocked(self, session: RecordingSession, start_time: float, end_time: float) -> bytes | None:
+        if not session.race_store_file:
+            return None
+        if session.id == self.active_recording_id and self.race_store is not None:
+            return self.race_store.export_packets(start_time, end_time)
+        path = self.sessions_dir / session.id / session.race_store_file
+        if not path.exists():
+            return None
+        return RaceSessionStore.read_packet_export(path, start_time, end_time)
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -859,7 +1065,7 @@ class SessionStore:
             latest["connected"] = self.last_packet_at is not None and monotonic() - self.last_packet_at < 3.0
             active = self.sessions.get(self.active_recording_id or "")
             selected = self.sessions.get(self.selected_session_id or "")
-            recording = active.summary(self.session_laps[active.id]) if active else None
+            recording = self._session_summary(active) if active else None
             if recording is not None:
                 recording["capturing_lap_number"] = self.active_lap_number if self.capture_current_lap else None
             return {
@@ -1029,9 +1235,24 @@ class SessionStore:
                 included = [lookup[lap_id] for lap_id in requested]
             else:
                 raise ExportError("Export scope must be 'session' or 'selected'")
-            if not included:
+            continuous_path = self.sessions_dir / session.id / session.race_store_file if session.race_store_file else None
+            if not included and not (scope == "session" and continuous_path and continuous_path.exists()):
                 raise ExportError("This export contains no completed laps")
-            report = build_markdown(session, included, self.notes, track_name(session.track_id, session.track_name_override))
+            timeline: list[dict[str, Any]] | None = None
+            if session.race_store_file:
+                try:
+                    lap_numbers = [lap.number for lap in included]
+                    timeline = self._race_timeline_unlocked(
+                        session_id, min(lap_numbers) if lap_numbers else None, max(lap_numbers) if lap_numbers else None,
+                    )
+                except SessionStateError:
+                    timeline = None
+            storage_summary = self._session_summary(session).get("continuous_store")
+            circuit_profile = self.profile_store.get(session.circuit_profile_id) if session.circuit_profile_id else None
+            report = build_markdown(
+                session, included, self.notes, track_name(session.track_id, session.track_name_override),
+                timeline, storage_summary, circuit_profile,
+            )
             base = safe_filename(session.name)
             if export_format == "markdown":
                 return f"{base}.md", "text/markdown; charset=utf-8", report.encode("utf-8")
@@ -1040,7 +1261,26 @@ class SessionStore:
                 if any(value is None for value in raw.values()):
                     missing = next(key for key, value in raw.items() if value is None)
                     raise ExportError(f"Original JSON is unavailable for lap {missing}")
-                return f"{base}.zip", "application/zip", build_zip(report, session, included, raw)  # type: ignore[arg-type]
+                continuous_data = None
+                scoped_packets = None
+                if scope == "session" and session.race_store_file:
+                    path = self.sessions_dir / session.id / session.race_store_file
+                    if session.id == self.active_recording_id and self.race_store is not None:
+                        continuous_data = self.race_store.snapshot_bytes()
+                    elif path.exists():
+                        continuous_data = RaceSessionStore.read_snapshot(path)
+                elif scope == "selected" and session.race_store_file:
+                    starts = [lap.first_session_time for lap in included if lap.first_session_time is not None]
+                    ends = [lap.last_session_time for lap in included if lap.last_session_time is not None]
+                    if starts and ends:
+                        # Include a short boundary margin for slower state/event
+                        # packets immediately before and after the lap samples.
+                        scoped_packets = self._race_packet_export_unlocked(
+                            session, max(0.0, min(starts) - 1.0), max(ends) + 1.0,
+                        )
+                return f"{base}.zip", "application/zip", build_zip(
+                    report, session, included, raw, timeline, continuous_data, scoped_packets, circuit_profile,
+                )  # type: ignore[arg-type]
             raise ExportError("Export format must be 'markdown' or 'zip'")
 
 
@@ -1065,8 +1305,9 @@ class UdpReceiver(Thread):
 
     def _handle(self, data: bytes) -> None:
         header = decode_header(data)
-        if header is None or header.packet_format != 2025 or header.game_year != 25:
+        if header is None or not supported_header(header):
             return
+        decoded: dict[str, Any] | None = None
         if header.packet_id == PACKET_SESSION:
             session = decode_session(data, header)
             if session:
@@ -1087,7 +1328,10 @@ class UdpReceiver(Thread):
             setup = decode_player_setup(data, header)
             if setup:
                 self.store.record_setup(setup, header.session_uid)
-        elif header.packet_id == PACKET_EVENT and decode_event_code(data, header) == "SEND":
+        decoded = decode_packet(data, header)
+        if decoded is not None:
+            self.store.record_full_packet(header, decoded)
+        if header.packet_id == PACKET_EVENT and decode_event_code(data, header) == "SEND":
             self.store.game_session_ended(header.session_uid)
 
     def stop(self) -> None:

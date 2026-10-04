@@ -9,7 +9,7 @@
   <body>
     <main>
       <header>
-        <div><p class="eyebrow">F1 25 · SILVERSTONE DEVELOPMENT</p><h1>Apex Engineer</h1></div>
+        <div><p class="eyebrow">F1 25 · UNIVERSAL CIRCUIT ANALYSIS</p><h1>Apex Engineer</h1></div>
         <div id="connection" class="status">Waiting for UDP</div>
       </header>
       <nav class="tabs" aria-label="Dashboard views">
@@ -68,7 +68,11 @@
           <p id="alignment-notice" class="notice"></p>
           <article class="panel chart-panel"><h2>Lap delta</h2><p class="hint">Candidate − baseline. Negative is faster.</p><div class="chart" data-chart="delta"></div></article>
           <article class="panel chart-panel"><h2>Speed</h2><div class="chart" data-chart="speed"></div></article>
+          <article id="line-overlay-panel" class="panel chart-panel" hidden><h2>Game-coordinate line overlay</h2><p class="hint">Motion X/Z; visual difference only, with no automatic handling diagnosis.</p><svg id="line-overlay" class="circuit-map" viewBox="0 0 800 360"></svg></article>
           <article class="panel chart-panel"><h2>Throttle & brake</h2><div class="chart" data-chart="pedals"></div></article>
+          <article id="motion-ex-panel" class="panel chart-panel" hidden><h2>Motion Ex</h2><p class="hint">Front-wheel angle and chassis yaw are measured channels. Slip traces are wheel-pair aggregates; no handling diagnosis is inferred automatically.</p><div class="chart" data-chart="motion-ex"></div></article>
+          <article id="wheel-slip-panel" class="panel chart-panel" hidden><h2>Wheel slip ratio</h2><p class="hint">Absolute front/rear wheel-pair averages from Motion Ex.</p><div class="chart" data-chart="wheel-slip"></div></article>
+          <article id="slip-angle-panel" class="panel chart-panel" hidden><h2>Wheel slip angle</h2><p class="hint">Absolute front/rear wheel-pair averages from Motion Ex, in radians. This view does not assert an understeer/oversteer diagnosis.</p><div class="chart" data-chart="slip-angle"></div></article>
           <article class="panel"><div class="panel-heading"><h2>Engineer Notes</h2><span class="hint">Trace evidence only</span></div><p id="calibration" class="notice"></p><div id="engineer-notes" class="notes-grid"></div></article>
         </div>
         <article id="analysis-empty" class="panel empty-state">Select two valid laps. The candidate delta is measured against the baseline.</article>
@@ -81,6 +85,23 @@
           <div class="rename-row"><input id="rename-session" maxlength="80" placeholder="Rename selected session"><button id="rename-button">Rename</button></div>
           <div id="track-override-row" class="rename-row" hidden><input id="track-override" maxlength="80" placeholder="Display name for unknown track"><button id="track-override-button">Set circuit display name</button><span class="hint">The numeric track ID remains the PB/comparison identity.</span></div>
         </article>
+        <article class="panel profile-editor">
+          <div class="panel-heading"><div><h2>Circuit profile</h2><p class="hint">Inspect a clean Motion X/Z trace, edit game-distance turn boundaries, then verify them manually. Approximate seeds remain labelled.</p></div></div>
+          <div class="profile-controls">
+            <label>Selected profile <select id="profile-select"></select></label>
+            <button id="profile-apply">Use for this session</button>
+            <button id="profile-alternate">Create alternate</button>
+            <label>Verification <select id="profile-verification"><option value="unverified">Unverified</option><option value="approximate">Approximate</option><option value="verified">Manually verified</option></select></label>
+            <label>Source/provenance <input id="profile-source" maxlength="200" placeholder="e.g. clean F1 25 60 Hz lap"></label>
+            <label>Calibration lap <select id="profile-lap"></select></label>
+            <button id="profile-load-trace">Load distance map</button>
+            <button id="profile-add-suggestions" disabled>Add turn suggestions</button>
+          </div>
+          <p id="profile-message" class="notice"></p>
+          <svg id="circuit-map" class="circuit-map" viewBox="0 0 800 360" role="img" aria-label="Recorded game-coordinate circuit trace"></svg>
+          <div id="profile-turns" class="profile-turns"></div>
+          <div class="profile-controls"><button id="profile-add-turn">Add turn</button><button id="profile-save" class="primary">Save profile</button></div>
+        </article>
         <article class="panel table-panel">
           <div class="panel-heading"><div><h2>Recorded laps</h2><p class="hint">Sorted fastest first; invalid laps can be included in reports.</p></div><span id="lap-count"></span></div>
           <div class="export-controls">
@@ -92,6 +113,10 @@
             <span id="export-error" class="error"></span>
           </div>
           <div class="table-scroll"><table><thead><tr><th>Export</th><th>Lap</th><th>Time</th><th>Sectors 1 / 2</th><th>Setup</th><th>Samples</th><th>Peak / min</th><th>Note or tag</th><th>Actions</th></tr></thead><tbody id="session-laps"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><div><h2>Race event timeline</h2><p class="hint">UDP events are direct game messages; state transitions are explicitly labelled inferred.</p></div></div>
+          <div id="race-timeline" class="race-timeline"><p class="empty">No continuous timeline for this session.</p></div>
         </article>
       </section>
     </main>

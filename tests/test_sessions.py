@@ -545,6 +545,10 @@ class RecordingSessionTests(unittest.TestCase):
             for index in range(30):
                 store.record_lap_state(lap_state(5, index * 1_000, index * 80), UID)
                 store.record_telemetry(telemetry(), index, UID)
+            # The abandoned future branch was game-invalid. After rewind the
+            # game clears its flag, so the recorder must not carry invented
+            # invalidity into the replacement timeline.
+            store.record_lap_state(lap_state(5, 30_000, 2_400, invalid=True), UID)
             store.record_lap_state(lap_state(5, 15_000, 1_200, invalid=False), UID)
             for index in range(40):
                 progress = index / 39

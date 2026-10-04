@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .analysis import ComparisonError, compare_laps
+from .analysis import ComparisonError, calibration_trace, compare_laps
+from .circuit_profiles import CircuitProfileError
 from .receiver import SessionStateError, SessionStore, UdpReceiver
 from .reports import ExportError
 from .setups import SETUP_FIELDS, SetupValidationError
@@ -40,6 +41,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return self._json({"personal_bests": self.store.list_personal_bests()})
         if path == "/api/setup-schema":
             return self._json({"fields": SETUP_FIELDS})
+        if path == "/api/circuit-profiles":
+            session_id = parse_qs(request.query).get("session", [None])[0]
+            return self._json({"profiles": self.store.list_profiles(session_id)})
+        if path.startswith("/api/sessions/") and path.endswith("/timeline"):
+            session_id = unquote(path[len("/api/sessions/"):-len("/timeline")].rstrip("/"))
+            query = parse_qs(request.query)
+            try:
+                lap_from = int(query["lap_from"][0]) if query.get("lap_from") else None
+                lap_to = int(query["lap_to"][0]) if query.get("lap_to") else None
+                return self._json({"events": self.store.race_timeline(session_id, lap_from, lap_to)})
+            except (SessionStateError, ValueError) as error:
+                return self._json({"error": str(error)}, 404)
         if path.startswith("/api/personal-bests/"):
             key = unquote(path[len("/api/personal-bests/"):].rstrip("/"))
             result = self.store.personal_best(key)
@@ -73,10 +86,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 missing = baseline_id if baseline is None else candidate_id
                 return self._json({"error": f"Unknown lap ID: {missing}"}, 404)
             try:
-                return self._json(compare_laps(baseline, candidate))
+                session = self.store.sessions.get(baseline.recording_session_id)
+                candidate_session = self.store.sessions.get(candidate.recording_session_id)
+                profile = self.store.profile_store.get(session.circuit_profile_id) if session and session.circuit_profile_id else None
+                if (
+                    baseline.mode == candidate.mode == "race"
+                    and baseline.recording_session_id != candidate.recording_session_id
+                    and (not session or not candidate_session or session.circuit_profile_id != candidate_session.circuit_profile_id)
+                ):
+                    raise ComparisonError("Cross-session race laps must select the same verified circuit profile")
+                return self._json(compare_laps(baseline, candidate, profile))
             except ComparisonError as error:
                 return self._json({"error": str(error)}, 400)
         if path.startswith("/api/laps/"):
+            if path.endswith("/trace"):
+                lap_id = unquote(path[len("/api/laps/"):-len("/trace")].rstrip("/"))
+                lap_object = self.store.get_lap_object(lap_id)
+                return self._json(calibration_trace(lap_object) if lap_object else {"error": "Lap not found"}, 200 if lap_object else 404)
             lap = self.store.lap(unquote(path.rsplit("/", 1)[-1]))
             return self._json(lap or {"error": "Lap not found"}, 200 if lap else 404)
         return super().do_GET()
@@ -98,6 +124,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return self._json(self.store.configure_diagnostics(payload["enabled"]))
             if path == "/api/personal-bests/rebuild":
                 return self._json(self.store.rebuild_personal_bests())
+            if path == "/api/circuit-profiles":
+                return self._json(self.store.save_profile(payload), 201)
             if path == "/api/sessions/select":
                 return self._json(self.store.select_session(str(payload.get("session_id", ""))))
             if path.startswith("/api/sessions/") and path.endswith("/rename"):
@@ -106,10 +134,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/sessions/") and path.endswith("/track-name"):
                 session_id = unquote(path[len("/api/sessions/"):-len("/track-name")].rstrip("/"))
                 return self._json(self.store.override_track_name(session_id, str(payload.get("name", ""))))
+            if path.startswith("/api/sessions/") and path.endswith("/circuit-profile"):
+                session_id = unquote(path[len("/api/sessions/"):-len("/circuit-profile")].rstrip("/"))
+                return self._json(self.store.select_profile(session_id, str(payload.get("profile_id", ""))))
             if path.startswith("/api/laps/") and path.endswith("/setup"):
                 lap_id = unquote(path[len("/api/laps/"):-len("/setup")].rstrip("/"))
                 return self._json(self.store.amend_lap_setup(lap_id, payload.get("setup")))
-        except (SessionStateError, SetupValidationError) as error:
+        except (SessionStateError, SetupValidationError, CircuitProfileError) as error:
             status = 404 if "Unknown" in str(error) else 409
             return self._json({"error": str(error)}, status)
         if path.startswith("/api/laps/") and path.endswith("/note"):
@@ -122,7 +153,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def _request_json(self) -> dict:
         try:
-            length = max(0, min(int(self.headers.get("Content-Length", "0")), 4096))
+            length = max(0, min(int(self.headers.get("Content-Length", "0")), 1024 * 1024))
             payload = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, json.JSONDecodeError) as error:
             raise ValueError from error

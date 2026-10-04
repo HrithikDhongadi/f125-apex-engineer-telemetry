@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from zipfile import ZipFile
 from io import BytesIO
@@ -24,6 +25,12 @@ class ExportTests(unittest.TestCase):
             store.record_lap_state(lap_state(2, current, distance, invalid=True), UID)
             store.record_telemetry(telemetry(170 + index), current / 1000, UID)
         store.record_lap_state(lap_state(3, 0, 0, 92_000), UID)
+        store.record_full_packet(SimpleNamespace(
+            packet_format=2025, game_year=25, game_major_version=1, game_minor_version=0,
+            packet_version=1, packet_id=6, session_uid=UID, session_time=45.0,
+            frame_identifier=900, overall_frame_identifier=901,
+            player_car_index=0, secondary_player_car_index=255,
+        ), {"player": {"speed_kph": 250}})
         store.stop_recording()
         laps = store.session_laps[run["id"]]
         store.set_note(laps[0].id, "baseline note")
@@ -56,6 +63,31 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(archive.read(lap_files[0]), original)
                 context = json.loads(archive.read("session.json"))
                 self.assertEqual(context["exported_lap_ids"], [laps[1].id])
+                profile = json.loads(archive.read("circuit-profile.json"))
+                self.assertEqual(profile["track_id"], 7)
+                self.assertEqual(profile["verification_status"], "approximate")
+                packet_rows = archive.read("race/selected-packets.jsonl").splitlines()
+                self.assertEqual(len(packet_rows), 1)
+                self.assertEqual(json.loads(packet_rows[0])["packet_id"], 6)
+
+    def test_report_contains_race_context_and_timeline_provenance(self):
+        with TemporaryDirectory() as directory:
+            store, session_id, laps = self._record_session(directory)
+            laps[0].race_context = {"start": {
+                "lap": {"position": 4, "delta_to_car_in_front_ms": 750, "delta_to_race_leader_ms": 2200, "pit_status": 0},
+                "car_status": {"fuel_kg": 42.5, "actual_tyre_compound": 18, "tyre_age_laps": 3, "ers_store_j": 3_100_000},
+                "damage": {"tyre_wear_pct": [8, 9, 10, 11]},
+                "session": {"safety_car_status": 0, "weather": 1},
+            }}
+            _name, _mime, body = store.export_session(session_id, "session", [], "markdown")
+            report = body.decode()
+            self.assertIn("fuel 42.5 kg", report)
+            self.assertIn("gap ahead 750 ms", report)
+            self.assertIn("recording_started · recorder", report)
+            self.assertIn("Continuous packets: 1", report)
+            self.assertIn("Packets dropped by storage limit: 0", report)
+            self.assertIn("Profile verification: approximate", report)
+            self.assertIn("estimated apex", report.lower())
 
     def test_empty_selection_is_rejected(self):
         with TemporaryDirectory() as directory:

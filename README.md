@@ -1,4 +1,4 @@
-# Apex Engineer v0.3
+# Apex Engineer v0.4
 
 A local-first F1 25 telemetry and lap-analysis tool for repeatable setup development. It uses only the Python standard library and vanilla HTML/CSS/JavaScript. Telemetry and notes remain on the receiving computer.
 
@@ -24,7 +24,9 @@ If port `8025` is already in use, an earlier copy is probably running. Open the 
 | UDP Format | `2025` |
 | UDP Broadcast Mode | Off |
 
-The decoder validates F1 25 format `2025` and Session packet version `1`. Session type `18` is treated as Time Trial; types `15–17` are races. Track identity comes from the game rather than being assumed. The official F1 25 track appendix is built in: Silverstone is ID `7`, while its reverse layout is the independent ID `39` (Austria/Zandvoort reverse are `40`/`41`). Unrecognised IDs appear as `Unknown track (ID n)`.
+The decoder follows EA's **F1 25 UDP specification v3**, validates format `2025`, and checks the packet-specific version before applying offsets. Unsupported versions are ignored rather than decoded with guessed layouts. Session type `18` is treated as Time Trial; types `15–17` are races. Track identity comes from the game rather than being assumed. The complete documented track-ID appendix is built in: Silverstone is ID `7`, while its reverse layout is the independent ID `39` (Austria/Zandvoort reverse are `40`/`41`). Unrecognised IDs appear as `Unknown track (ID n)`.
+
+The continuous store decodes Motion (0), Session (1), Lap Data (2), Event (3), Participants (4), Setups (5), Car Telemetry (6), Car Status (7), Final Classification (8), Car Damage (10), Session History (11), Tyre Sets (12), Motion Ex (13), and Lap Positions (15). Every stored row retains the session UID, packet ID/version, both frame identifiers, session/receive time, player index, and available lap distance. Same-frame rows can be joined by overall frame ID; slower packets carry their own timestamp and freshness interval.
 
 Packet ID `5` is decoded using the complete packed 50-byte `CarSetupData` stride. Setup snapshots include aero, both differential settings, signed camber/toe floats, suspension, anti-roll bars, ride heights, brakes, engine braking, the four configured tyre pressures with explicit wheel names, ballast, and fuel load. These pressures are setup values and are never substituted with measured Car Telemetry pressures. Older four-field files remain valid; all absent settings display as `unknown`.
 
@@ -55,6 +57,10 @@ The initial segment captures the first few laps; up to seven additional rewind/R
 
 Race types start a recording automatically. The first lap is captured directly from the starting grid when the initial packet identifies lap 1 at the beginning of game session time; grid position may place the car beyond 0 m and does not cause lap 1 to be omitted. A recording closes when the game session ends or its session UID changes. **Stop recording** can close it manually; the same game UID will not automatically reopen afterward. A new game session can start another recording.
 
+Race packet data is committed continuously to `race-data.sqlite3` in WAL mode. Grid time, incomplete laps, pit-lane running, safety-car periods and the finish therefore survive without waiting for a completed lap. On restart, an open `session.json` is marked `interrupted`, while the already committed database remains readable. The database is capped at 8 GiB per recording so a 60 Hz full race has room while disk growth remains bounded; its dashboard summary reports stored rows, estimated missing high-rate frames, dropped rows and bytes. The estimate is explicitly not proof of network loss for slow packet types.
+
+The timeline preserves direct game events (lights, lights out, penalties, overtakes, safety car, red flag, flashback, chequered flag and final classification) and labels derived changes such as pit entry/exit, position, tyre compound, weather and damage as `inferred`. Completed lap JSON also snapshots available start/finish race context: fuel, compound/age, ERS, position/gaps, pit state, safety car/weather and damage. Restricted opponent channels remain absent/zero exactly as sent; Apex Engineer does not reconstruct private fuel, setup, damage or tyre data.
+
 Changing setup during a lap does not relabel that lap: each completed lap retains the setup seen at its start.
 
 ## Session library and historical data
@@ -76,6 +82,9 @@ data/
     session-<timestamp>-<suffix>/
       session.json                   Name, mode, UID, track, status, lap IDs
       lap-*.json                     Completed laps from this recording
+      race-data.sqlite3              Incremental packet stream and event timeline
+  circuit_profiles/
+    f1-2025-track-<id>-<layout>-v1.json  Editable circuit/turn calibration
 ```
 
 Root-level captures appear as the read-only **Legacy captures** group. They are never moved, renamed, overwritten, or deleted.
@@ -85,7 +94,7 @@ Root-level captures appear as the read-only **Legacy captures** group. They are 
 In the **Session** view, use the checkbox beside each lap or **Select all/Clear**, then choose either **Selected laps** or **Whole session**. The dashboard shows the expected lap count before downloading.
 
 - **Download Markdown** creates a compact report containing session identity, lap validity, official lap/sectors, available setup values, notes, sample coverage, trace-derived speed/braking/throttle observations, and compatible official-time deltas.
-- **Download full data ZIP** contains that report, scoped session metadata, and byte-for-byte copies of the original included lap JSON files. Selected-lap exports contain no other raw laps.
+- **Download full data ZIP** contains that report, scoped session metadata, the selected circuit profile/provenance, byte-for-byte copies of the original included lap JSON files, and the relevant event timeline. A whole-session ZIP also includes a consistent online-backup snapshot of the continuous SQLite database, including committed WAL rows. A selected-lap ZIP includes only the selected lap JSON plus `selected-packets.jsonl`, bounded to the selected laps' recorded session-time range with a one-second margin for slower state packets.
 
 Invalid laps may be exported for setup review and are labelled `INVALID`. Reports label missing and estimated values and do not claim that a setup change caused a time change. Export generation is read-only and does not rewrite the source session.
 
@@ -112,15 +121,26 @@ Delta is always `candidate − baseline`; negative means the candidate is faster
 
 Baseline and candidate each have their own session/PB selector followed by a lap-number selector. Lap options show official time and validity. Selections survive the periodic dashboard refresh, and incompatibility is explained before the comparison request.
 
-- Valid race laps may be compared only within the same race recording.
+- Valid race laps compare freely within one race recording. Cross-session race comparison is enabled only when both sessions select the same manually `verified` circuit profile; race-context flags remain visible so fuel, tyres, traffic, weather, damage, pit or safety-car effects are not mislabelled as pure pace.
 - Time Trial laps from separate runs may be compared when both have the same known track.
 - Race and Time Trial laps cannot be compared.
 - Legacy captures may be compared with other legacy captures, but their missing lap distance means the trace is a time-normalized approximation.
-- Silverstone corner notes appear only when both laps have real distance data and the game positively identifies normal Silverstone as track ID `7`.
+- Turn notes appear only when both laps have real distance data and a compatible circuit profile with turn boundaries is selected.
 
 The final UDP sample usually occurs just before the timing line. To avoid a one-point delta spike, the small difference between sampled progression and each official lap time is distributed linearly across the trace. The API and UI report the applied correction.
 
-Silverstone windows remain approximate until precise track-distance calibration is implemented. Legacy comparisons and non-Silverstone tracks receive basic trace comparison without corner windows, braking distances, or Silverstone-specific notes.
+The bundled normal-Silverstone profile is only a migration of the earlier normalized windows and is visibly labelled `approximate`; it is not calibrated metre mapping. Every other circuit starts with full-lap/sector comparison and no invented turns. Reverse layouts have distinct profile identities and can never borrow the normal-layout profile silently.
+
+## Circuit profile calibration
+
+Profiles are keyed by UDP format, numeric track ID, layout and schema version. They store the game-measured length, optional X/Z centreline, sector boundaries, editable turns (number/name, entry, estimated apex, exit, direction and linked complex), provenance and verification state.
+
+1. Record a clean, complete lap with Motion packets enabled. Do not use a pit lap, incomplete/invalid lap, flashback or Restart Lap branch.
+2. In **Session → Circuit profile**, choose the calibration lap and select **Load distance map**. The trace uses the game's X/Z coordinates and lap distance. Orange curvature candidates can be added as unverified draft turns; they are suggestions only.
+3. Add or adjust entry/apex/exit distances and names. Record whether a linked sequence is one complex, then save and select the profile. Use **Create alternate** when identification or calibration is uncertain; it creates a separately keyed profile and never changes track/PB identity.
+4. Verify the result in game against several clean laps in both dry and wet conditions. FIA diagrams may guide turn numbers/layout only; they are not treated as F1 25 metre calibration. No third-party map graphic is bundled.
+
+Turn comparison reports braking threshold, estimated apex/minimum speed, throttle pickup, exit speed and time gain/loss when the channels exist. Motion Ex wheel slip, front-wheel angle and chassis yaw are captured for future overlays. Labels avoid diagnosing understeer/oversteer from steering alone.
 
 ## API
 
@@ -140,6 +160,11 @@ GET  /api/laps[?session=<session_id>]
 GET  /api/laps/<lap_id>
 POST /api/laps/<lap_id>/note             {"note":"Stowe test"}
 GET  /api/setup-schema
+GET  /api/circuit-profiles[?session=<session_id>]
+POST /api/circuit-profiles               {profile JSON}
+POST /api/sessions/<id>/circuit-profile {"profile_id":"..."}
+GET  /api/laps/<lap_id>/trace
+GET  /api/sessions/<id>/timeline[?lap_from=n&lap_to=n]
 POST /api/laps/<lap_id>/setup            {"setup":{"front_camber":-3.5}}
 GET  /api/compare?baseline=<id>&candidate=<id>
 GET  /api/personal-bests
@@ -159,5 +184,7 @@ python3 -m py_compile src/f1telemetry/*.py
 ## Current limitations
 
 - Race-strategy prediction is not implemented.
-- Live fuel burn, ERS, tyre wear/damage, tyre compound/age, gaps, positions, and pit windows await future packet decoders. Configured setup fuel load is decoded.
-- Restart Lap and flashback transitions are covered by synthetic regression tests. A live Silverstone Time Trial trace also covers the same-number, zero-timer approach transition that previously lost the first complete lap; other game modes and packet-ordering variations still require live confirmation.
+- Only normal Silverstone has a bundled turn seed, and that seed is approximate. All other normal/reverse circuits need a clean Motion X/Z calibration lap and manually verified turn distances/names before turn-level claims appear.
+- The next validation captures needed are: one clean 60 Hz race from grid to classification with at least one pit stop; one safety-car or VSC race; one race flashback where the game clears validity; and one clean lap for each layout to calibrate. Keep packet IDs 0–15 enabled via format 2025 and retain the resulting `race-data.sqlite3`.
+- UDP is lossy and opponent telemetry may be deliberately restricted by the game. Missing channels are shown as unavailable; frame-gap counts are estimates, not reconstructed samples.
+- Restart Lap and flashback transitions retain the existing synthetic and live-sequence regressions. Additional real captures on non-Silverstone layouts remain valuable for validating boundary ordering.

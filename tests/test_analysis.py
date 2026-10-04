@@ -37,6 +37,36 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(comparison["summary"]["final_delta_s"], -1.0)
         self.assertEqual(comparison["trace"][-1]["delta_s"], -1.0)
 
+    def test_verified_profile_allows_cross_session_race_comparison(self):
+        samples = [
+            {"lap_distance_m": 0, "current_lap_ms": 0, "speed_kph": 100, "throttle": 0, "brake": 0, "steering": 0, "gear": 2},
+            {"lap_distance_m": 5000, "current_lap_ms": 90_000, "speed_kph": 200, "throttle": 100, "brake": 0, "steering": 0, "gear": 7},
+        ]
+        first = Lap(1, 90_000, False, samples=samples, saved_at="a", recording_session_id="race-a", mode="race", track_id=2, track_length_m=5000)
+        second = Lap(1, 91_000, False, samples=samples, saved_at="b", recording_session_id="race-b", mode="race", track_id=2, track_length_m=5000)
+        profile = {"id": "verified", "circuit_name": "Shanghai", "verification_status": "verified", "measured_game_length_m": 5000, "turns": []}
+        self.assertEqual(compare_laps(first, second, profile)["summary"]["final_delta_s"], 1.0)
+
+    def test_profile_turn_metrics_include_estimated_apex_exit_and_input_thresholds(self):
+        baseline_samples = [
+            {**sample(0, 0, 250), "brake": 0, "throttle": 100, "steering": 0},
+            {**sample(100, 10_000, 150), "brake": 80, "throttle": 0, "steering": 20},
+            {**sample(200, 20_000, 120), "brake": 0, "throttle": 30, "steering": 30},
+            {**sample(300, 30_000, 190), "brake": 0, "throttle": 100, "steering": 0},
+        ]
+        candidate_samples = [dict(row, current_lap_ms=row["current_lap_ms"] + index * 100) for index, row in enumerate(baseline_samples)]
+        baseline = Lap(1, 30_000, False, samples=baseline_samples, saved_at="turn-a")
+        candidate = Lap(2, 30_300, False, samples=candidate_samples, saved_at="turn-b")
+        profile = {
+            "id": "test", "circuit_name": "Test", "verification_status": "verified",
+            "measured_game_length_m": 300,
+            "turns": [{"number": 1, "name": "Test turn", "entry_m": 0, "estimated_apex_m": 200, "exit_m": 300, "direction": "right", "verification_status": "verified"}],
+        }
+        turn = compare_laps(baseline, candidate, profile)["engineer_notes"]["windows"][0]
+        self.assertEqual(turn["estimated_apex_m"], 200)
+        self.assertIn("candidate_exit_speed_kph", turn["evidence"])
+        self.assertTrue(any("estimated apex" in text for text in turn["statements"]))
+
 
 class SessionStoreTests(unittest.TestCase):
     def test_setup_is_exposed_in_live_state(self):

@@ -52,7 +52,12 @@ def _observations(lap: Any) -> list[str]:
     return observations or ["Telemetry observations unavailable."]
 
 
-def build_markdown(session: Any, laps: list[Any], notes: dict[str, str], track_label: str) -> str:
+def build_markdown(
+    session: Any, laps: list[Any], notes: dict[str, str], track_label: str,
+    timeline: list[dict[str, Any]] | None = None,
+    storage_summary: dict[str, Any] | None = None,
+    circuit_profile: dict[str, Any] | None = None,
+) -> str:
     lines = [
         f"# Apex Engineer report — {session.name}", "",
         "## Session", "",
@@ -64,6 +69,20 @@ def build_markdown(session: Any, laps: list[Any], notes: dict[str, str], track_l
         "| Lap | Status | Lap time | Sector 1 | Sector 2 | Samples | Coverage | Setup | Note |",
         "|---:|---|---:|---:|---:|---:|---:|---|---|",
     ]
+    if storage_summary:
+        lines[10:10] = [
+            f"- Continuous packets: {storage_summary.get('packet_count', 'unknown')}",
+            f"- Timeline events: {storage_summary.get('event_count', 'unknown')}",
+            f"- Estimated missing high-rate frames: {storage_summary.get('missing_frame_estimate', 'unknown')}",
+            f"- Packets dropped by storage limit: {storage_summary.get('dropped_packets', 0)}",
+        ]
+    if circuit_profile:
+        provenance = circuit_profile.get("provenance") or {}
+        lines[10:10] = [
+            f"- Circuit profile: {circuit_profile.get('id', 'unknown')}",
+            f"- Profile verification: {circuit_profile.get('verification_status', 'unverified')}",
+            f"- Profile source: {provenance.get('source', 'unavailable')}",
+        ]
     for lap in laps:
         quality = lap_quality(lap)
         coverage = f"{quality['coverage_pct']:.1f}%" if quality["coverage_pct"] is not None else "estimated/unavailable"
@@ -77,6 +96,46 @@ def build_markdown(session: Any, laps: list[Any], notes: dict[str, str], track_l
             source = "manually supplied" if row["source"] == "manual" else "decoded from UDP" if row["source"] else "unknown"
             lines.append(f"- {row['label']}: {value} — {source}")
         lines.append("")
+    lines.extend(["## Circuit calibration", ""])
+    if circuit_profile:
+        lines.append(
+            f"Profile `{circuit_profile.get('id')}` is labelled **{circuit_profile.get('verification_status', 'unverified')}**. "
+            "Estimated apex positions are not physical survey measurements."
+        )
+        for turn in circuit_profile.get("turns", []):
+            lines.append(
+                f"- Turn {turn.get('number', '?')} — {turn.get('name') or 'unnamed'}: "
+                f"{turn.get('entry_m')} / {turn.get('estimated_apex_m')} / {turn.get('exit_m')} m "
+                f"(entry / estimated apex / exit), {turn.get('direction', 'unknown')}, "
+                f"{turn.get('verification_status', 'unverified')}; source: {turn.get('provenance', 'unavailable')}."
+            )
+    else:
+        lines.append("No turn profile was selected; only full-lap and sector evidence is available.")
+    lines.append("")
+    lines.extend(["## Race context", ""])
+    for lap in laps:
+        context = lap.race_context or {}
+        if not context:
+            lines.append(f"- Lap {lap.number}: unavailable (legacy or lap-only capture).")
+            continue
+        start = context.get("start", {})
+        status = start.get("car_status", {})
+        damage = start.get("damage", {})
+        lap_state = start.get("lap", {})
+        session_state = start.get("session", {})
+        lines.append(
+            f"- Lap {lap.number}: position {lap_state.get('position', 'unknown')}; gap ahead {lap_state.get('delta_to_car_in_front_ms', 'unknown')} ms; "
+            f"leader gap {lap_state.get('delta_to_race_leader_ms', 'unknown')} ms; pit status {lap_state.get('pit_status', 'unknown')}; "
+            f"fuel {status.get('fuel_kg', 'unknown')} kg; compound {status.get('actual_tyre_compound', 'unknown')}; "
+            f"tyre age {status.get('tyre_age_laps', 'unknown')} laps; wear {damage.get('tyre_wear_pct', 'unknown')}; ERS {status.get('ers_store_j', 'unknown')} J; "
+            f"safety car {session_state.get('safety_car_status', 'unknown')}; weather {session_state.get('weather', 'unknown')}."
+        )
+    lines.extend(["", "## Race event timeline", ""])
+    if timeline:
+        for event in timeline:
+            lines.append(f"- {event.get('session_time', 0):.3f} s · {event.get('type', 'event')} · {event.get('source', 'unknown')} · lap {event.get('lap_number') or '—'}")
+    else:
+        lines.append("Continuous race timeline unavailable for this legacy/lap-only capture.")
     lines.extend(["## Trace observations", ""])
     for lap in laps:
         quality = lap_quality(lap)
@@ -114,7 +173,12 @@ def build_markdown(session: Any, laps: list[Any], notes: dict[str, str], track_l
     return "\n".join(lines)
 
 
-def build_zip(report: str, session: Any, laps: list[Any], raw_laps: dict[str, bytes]) -> bytes:
+def build_zip(
+    report: str, session: Any, laps: list[Any], raw_laps: dict[str, bytes],
+    timeline: list[dict[str, Any]] | None = None, continuous_data: bytes | None = None,
+    scoped_packets: bytes | None = None,
+    circuit_profile: dict[str, Any] | None = None,
+) -> bytes:
     stream = BytesIO()
     with ZipFile(stream, "w", ZIP_DEFLATED) as archive:
         archive.writestr("report.md", report.encode("utf-8"))
@@ -122,6 +186,14 @@ def build_zip(report: str, session: Any, laps: list[Any], raw_laps: dict[str, by
         context["lap_ids"] = [lap.id for lap in laps]
         context["exported_lap_ids"] = [lap.id for lap in laps]
         archive.writestr("session.json", json.dumps(context, indent=2).encode("utf-8"))
+        if circuit_profile is not None:
+            archive.writestr("circuit-profile.json", json.dumps(circuit_profile, indent=2).encode("utf-8"))
+        if timeline is not None:
+            archive.writestr("race/timeline.json", json.dumps(timeline, indent=2).encode("utf-8"))
+        if continuous_data is not None:
+            archive.writestr("race/race-data.sqlite3", continuous_data)
+        if scoped_packets is not None:
+            archive.writestr("race/selected-packets.jsonl", scoped_packets)
         for lap in laps:
             raw = raw_laps.get(lap.id)
             if raw is None:

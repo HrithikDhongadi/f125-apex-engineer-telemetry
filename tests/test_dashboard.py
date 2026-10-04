@@ -18,6 +18,15 @@ class DashboardContractTests(unittest.TestCase):
         self.assertEqual(track_name(39), "Silverstone (Reverse)")
         self.assertEqual(track_name(99), "Unknown track (ID 99)")
 
+    def test_circuit_profile_editor_exposes_trace_alternates_and_verification(self):
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        for element_id in (
+            "profile-select", "profile-alternate", "profile-verification",
+            "profile-source", "profile-lap", "profile-load-trace", "circuit-map",
+            "profile-add-suggestions", "race-timeline",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,41 @@ class RecordingSessionTests(unittest.TestCase):
             fill_lap(store, UID, 2)
             self.assertEqual([lap.number for lap in store.session_laps[started["id"]]], [2])
 
+    def test_time_trial_started_just_before_line_excludes_lap_19_and_saves_full_lap_20(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+
+            # The HUD still says lap 19 on the approach to the line. Starting
+            # here must arm the run, not claim this partial lap as complete.
+            store.record_lap_state(lap_state(19, 89_000, 5_885), UID)
+            run = store.start_time_trial_run("just behind the line")
+            self.assertEqual(run["status"], "armed")
+            store.record_telemetry(telemetry(90), 100.0, UID)
+            self.assertEqual(store.active_samples, [])
+
+            # At the line the game changes to lap 20. Capture starts under that
+            # actual game lap number; lap 19 is neither saved nor synthesized.
+            store.record_lap_state(lap_state(20, 0, 0.45, 89_000), UID)
+            snapshot = store.snapshot()
+            self.assertEqual(snapshot["recording"]["status"], "recording")
+            self.assertEqual(snapshot["recording"]["capturing_lap_number"], 20)
+
+            for index in range(30):
+                progress = index / 29
+                current = int(progress * (89_242 - 60))
+                distance = 0.45 + progress * (5_887.44 - 0.45)
+                store.record_lap_state(lap_state(20, current, distance), UID)
+                store.record_telemetry(telemetry(180 + index), 101 + progress * 89.182, UID)
+            store.record_lap_state(lap_state(21, 0, 0, 89_242), UID)
+
+            recorded = store.session_laps[run["id"]]
+            self.assertEqual([lap.number for lap in recorded], [20])
+            self.assertEqual(recorded[0].time_ms, 89_242)
+            self.assertAlmostEqual(recorded[0].samples[0]["lap_distance_m"], 0.45)
+            self.assertAlmostEqual(recorded[0].samples[-1]["lap_distance_m"], 5_887.44)
+            self.assertNotIn(90, [sample["speed_kph"] for sample in recorded[0].samples])
+
     def test_stop_discards_only_partial_lap(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
@@ -220,6 +255,7 @@ class RecordingSessionTests(unittest.TestCase):
             # be discarded, and the next crossing has no completed-lap time.
             store.record_lap_state(lap_state(8, 0, -60, 0), UID)
             store.record_lap_state(lap_state(9, 100, 5, 0), UID)
+            self.assertEqual(store.snapshot()["recording"]["capturing_lap_number"], 9)
             fill_lap(store, UID, 9)
 
             recorded = store.session_laps[run["id"]]

@@ -35,11 +35,13 @@ Packet ID `5` is decoded using the complete packed 50-byte `CarSetupData` stride
 1. Enter Time Trial and wait for **Time trial** and the track name to appear.
 2. Enter a short run name such as `18/18 baseline` or `rear wing +1`.
 3. Select **Start new run**.
-4. If the car is already partway around the lap, the run shows **Armed—waiting for start/finish line** and begins with the next complete lap.
+4. If the car is already partway around the lap, the run shows **Armed — waiting for the next start/finish crossing; the partial approach is excluded.** At that crossing, capture begins using the lap number reported by the game. The dashboard then shows **Recording lap n**.
 5. Select **Stop recording** when the run is finished. Completed laps remain saved; only the current incomplete lap is discarded.
 6. Start another named run under the same in-game Time Trial session whenever required.
 
 **Restart Lap and flashbacks:** an abandoned partial lap is discarded. Crossing the line after Restart Lap starts a clean capture even when the game reports `last_lap_ms = 0`; that zero prevents the abandoned lap from being saved but no longer prevents the new lap from being recorded. A run started before the first Lap Data packet remains armed until a verified start/finish crossing. Midlap time/distance rewinds and implausible midlap lap-number jumps do not create completed laps.
+
+**Why the first saved number can look skipped:** the game owns lap numbering; Apex Engineer never renumbers laps. For example, if a run is started just before the line while the HUD says lap 19, that lap-19 approach is only a partial lap and is excluded. When the HUD changes to lap 20 at the line, the recorder begins capturing lap 20 and saves it at the following crossing. Earlier laps may belong to another recording, so the new session correctly begins with a `lap-...-20.json` file and does not create a placeholder lap 19.
 
 ### Race
 

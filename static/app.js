@@ -44,10 +44,16 @@ function renderRecorder() {
   const recording=activeRecording, mode=latestState.game_mode||"unknown", track=latestState.track_name||"Unknown track";
   const badge=$("recording-badge");
   badge.className=`recording-badge ${recording?.status==="armed"?"armed":recording?"active":""}`;
-  badge.textContent=recording?(recording.status==="armed"?"Armed":"Recording"):"Not recording";
+  badge.textContent=recording?(recording.status==="armed"?"Armed":recording.capturing_lap_number!=null?`Recording lap ${recording.capturing_lap_number}`:"Recording"):"Not recording";
   $("recording-name").textContent=recording?.name||(mode==="race"?"Race recorder ready":mode==="time_trial"?"Time Trial · start a run":"Waiting for game session");
   $("game-context").textContent=`${mode.replace("_"," ")} · ${track}${latestState.game_session_uid?` · game UID ${latestState.game_session_uid}`:""}`;
-  $("recording-message").textContent=recording?.status==="armed"?"Armed—waiting for start/finish line.":"";
+  $("recording-message").textContent=recording?.status==="armed"
+    ? "Armed — waiting for the next start/finish crossing; the partial approach is excluded."
+    : recording?.capturing_lap_number!=null
+      ? `Capturing lap ${recording.capturing_lap_number}; it will be saved at the next verified start/finish crossing.`
+      : recording
+        ? "Recording active — waiting for the next complete-lap start/finish crossing."
+        : "";
   $("run-name").hidden=mode!=="time_trial"||Boolean(recording);
   $("start-run").hidden=mode!=="time_trial"||Boolean(recording);
   $("stop-recording").hidden=!recording;

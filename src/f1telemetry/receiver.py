@@ -533,10 +533,13 @@ class SessionStore:
             latest["connected"] = self.last_packet_at is not None and monotonic() - self.last_packet_at < 3.0
             active = self.sessions.get(self.active_recording_id or "")
             selected = self.sessions.get(self.selected_session_id or "")
+            recording = active.summary(self.session_laps[active.id]) if active else None
+            if recording is not None:
+                recording["capturing_lap_number"] = self.active_lap_number if self.capture_current_lap else None
             return {
                 "latest": latest,
                 "laps": [lap.summary(self.notes.get(lap.id, "")) for lap in self.session_laps.get(self.selected_session_id or "", [])],
-                "recording": active.summary(self.session_laps[active.id]) if active else None,
+                "recording": recording,
                 "selected_session_id": self.selected_session_id,
                 "selected_is_active": bool(active and selected and active.id == selected.id),
             }

@@ -14,6 +14,7 @@ class ExportTests(unittest.TestCase):
     def _record_session(self, directory):
         store = SessionStore(Path(directory))
         store.record_game_session(game())
+        store.record_setup({"front_wing": 19, "rear_wing": 17, "on_throttle_diff": 20, "off_throttle_diff": 45}, UID)
         store.record_lap_state(lap_state(1), UID)
         run = store.start_time_trial_run("18/18 baseline: report")
         fill_lap(store, UID, 1, 90_000)
@@ -39,6 +40,8 @@ class ExportTests(unittest.TestCase):
             self.assertIn("INVALID", report)
             self.assertIn(f"| {laps[0].number} | valid", report)
             self.assertIn(f"| {laps[1].number} | INVALID", report)
+            self.assertIn("Front camber: unknown", report)
+            self.assertIn("decoded from UDP", report)
 
     def test_selected_zip_contains_only_selected_raw_lap(self):
         with TemporaryDirectory() as directory:

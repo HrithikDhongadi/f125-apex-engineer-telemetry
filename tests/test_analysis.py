@@ -45,7 +45,8 @@ class SessionStoreTests(unittest.TestCase):
             setup = {"front_wing": 18, "rear_wing": 18, "on_throttle_diff": 25, "off_throttle_diff": 50}
             store.record_setup(setup)
             latest = store.snapshot()["latest"]
-            self.assertEqual(latest["setup"], setup)
+            self.assertEqual({key: latest["setup"][key] for key in setup}, setup)
+            self.assertTrue(all(value == "decoded_udp" for value in latest["setup"]["_provenance"].values()))
             self.assertEqual(latest["front_wing"], 18)
 
     def test_old_capture_loads_and_uses_legacy_alignment(self):

@@ -56,8 +56,8 @@
           <p id="pb-message" class="notice"></p><div id="pb-cards" class="pb-cards"></div><pre id="pb-details" class="pb-details" hidden></pre>
         </article>
         <article class="panel compare-controls">
-          <div><label for="baseline">Baseline lap</label><select id="baseline"></select></div>
-          <div><label for="candidate">Candidate lap</label><select id="candidate"></select></div>
+          <fieldset><legend>Baseline</legend><label for="baseline-session">Session or PB</label><select id="baseline-session"></select><label for="baseline">Lap</label><select id="baseline"></select></fieldset>
+          <fieldset><legend>Candidate</legend><label for="candidate-session">Session or PB</label><select id="candidate-session"></select><label for="candidate">Lap</label><select id="candidate"></select></fieldset>
           <button id="compare">Compare valid laps</button>
           <p id="compare-error" class="error" role="alert"></p>
         </article>
@@ -77,6 +77,7 @@
           <div class="panel-heading"><div><h2>Session library</h2><p class="hint">Select a session to inspect it. Legacy captures are read-only.</p></div></div>
           <div id="session-cards" class="session-cards"></div>
           <div class="rename-row"><input id="rename-session" maxlength="80" placeholder="Rename selected session"><button id="rename-button">Rename</button></div>
+          <div id="track-override-row" class="rename-row" hidden><input id="track-override" maxlength="80" placeholder="Display name for unknown track"><button id="track-override-button">Set circuit display name</button><span class="hint">The numeric track ID remains the PB/comparison identity.</span></div>
         </article>
         <article class="panel table-panel">
           <div class="panel-heading"><div><h2>Recorded laps</h2><p class="hint">Sorted fastest first; invalid laps can be included in reports.</p></div><span id="lap-count"></span></div>
@@ -88,10 +89,18 @@
             <button id="download-report">Download Markdown</button><button id="download-zip">Download full data ZIP</button>
             <span id="export-error" class="error"></span>
           </div>
-          <div class="table-scroll"><table><thead><tr><th>Export</th><th>Lap</th><th>Time</th><th>Sectors 1 / 2</th><th>Setup</th><th>Samples</th><th>Peak / min</th><th>Note or tag</th></tr></thead><tbody id="session-laps"></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>Export</th><th>Lap</th><th>Time</th><th>Sectors 1 / 2</th><th>Setup</th><th>Samples</th><th>Peak / min</th><th>Note or tag</th><th>Actions</th></tr></thead><tbody id="session-laps"></tbody></table></div>
         </article>
       </section>
     </main>
+    <dialog id="setup-dialog">
+      <form id="setup-form" method="dialog">
+        <div class="panel-heading"><div><h2 id="setup-title">Edit historical setup</h2><p class="hint">Blank values stay unknown. Existing captured values remain unchanged unless edited.</p></div><button type="button" id="setup-close">Close</button></div>
+        <div id="setup-fields" class="setup-form-grid"></div>
+        <p id="setup-message" class="notice"></p>
+        <div class="dialog-actions"><button type="submit" class="primary">Save setup amendment</button></div>
+      </form>
+    </dialog>
     <div id="tooltip" class="tooltip" hidden></div>
     <script src="app.js"></script>
   </body>

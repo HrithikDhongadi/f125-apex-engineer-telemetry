@@ -45,6 +45,7 @@ class PersonalBestTests(unittest.TestCase):
             partial.samples = partial.samples[10:20]
             self.assertIsNone(registry.consider(partial, "partial"))
             self.assertIsNone(registry.consider(complete_lap(79_000, track_id=-1), "unknown"))
+            self.assertIsNone(registry.consider(complete_lap(78_000, track_id=99), "unrecognised positive ID"))
             self.assertEqual(registry.get(pb_key(7, "time_trial"))["time_ms"], 90_000)
 
     def test_registry_persists_full_lap_after_restart(self):

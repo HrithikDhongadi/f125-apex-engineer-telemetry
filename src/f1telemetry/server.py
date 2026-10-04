@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from .analysis import ComparisonError, compare_laps
 from .receiver import SessionStateError, SessionStore, UdpReceiver
 from .reports import ExportError
+from .setups import SETUP_FIELDS, SetupValidationError
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "static"
@@ -37,6 +38,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return self._json({"sessions": self.store.list_sessions(), **self.store.snapshot()})
         if path == "/api/personal-bests":
             return self._json({"personal_bests": self.store.list_personal_bests()})
+        if path == "/api/setup-schema":
+            return self._json({"fields": SETUP_FIELDS})
         if path.startswith("/api/personal-bests/"):
             key = unquote(path[len("/api/personal-bests/"):].rstrip("/"))
             result = self.store.personal_best(key)
@@ -96,7 +99,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if path.startswith("/api/sessions/") and path.endswith("/rename"):
                 session_id = unquote(path[len("/api/sessions/"):-len("/rename")].rstrip("/"))
                 return self._json(self.store.rename_session(session_id, str(payload.get("name", ""))))
-        except SessionStateError as error:
+            if path.startswith("/api/sessions/") and path.endswith("/track-name"):
+                session_id = unquote(path[len("/api/sessions/"):-len("/track-name")].rstrip("/"))
+                return self._json(self.store.override_track_name(session_id, str(payload.get("name", ""))))
+            if path.startswith("/api/laps/") and path.endswith("/setup"):
+                lap_id = unquote(path[len("/api/laps/"):-len("/setup")].rstrip("/"))
+                return self._json(self.store.amend_lap_setup(lap_id, payload.get("setup")))
+        except (SessionStateError, SetupValidationError) as error:
             status = 404 if "Unknown" in str(error) else 409
             return self._json({"error": str(error)}, status)
         if path.startswith("/api/laps/") and path.endswith("/note"):

@@ -11,6 +11,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from .analysis import ComparisonError, compare_laps
 from .quality import lap_quality
+from .setups import setup_rows
 
 
 class ExportError(ValueError):
@@ -29,14 +30,12 @@ def _time(ms: int | None) -> str:
 
 
 def _setup(setup: dict[str, Any] | None) -> str:
-    if not setup:
-        return "unavailable"
-    labels = (
-        ("front_wing", "front wing"), ("rear_wing", "rear wing"),
-        ("on_throttle_diff", "on-throttle differential"),
-        ("off_throttle_diff", "off-throttle differential"),
-    )
-    return ", ".join(f"{label}: {setup[key]}{'%' if 'diff' in key else ''}" for key, label in labels if key in setup) or "unavailable"
+    parts = []
+    for row in setup_rows(setup):
+        value = "unknown" if row["value"] is None else f"{row['value']}{(' ' + row['unit']) if row['unit'] else ''}"
+        source = "manual" if row["source"] == "manual" else "UDP" if row["source"] else "missing"
+        parts.append(f"{row['label']}: {value} [{source}]")
+    return "; ".join(parts)
 
 
 def _observations(lap: Any) -> list[str]:
@@ -70,7 +69,15 @@ def build_markdown(session: Any, laps: list[Any], notes: dict[str, str], track_l
         coverage = f"{quality['coverage_pct']:.1f}%" if quality["coverage_pct"] is not None else "estimated/unavailable"
         note = notes.get(lap.id, "").replace("|", "\\|") or "—"
         lines.append(f"| {lap.number} | {'INVALID' if lap.invalid else 'valid'} | {_time(lap.time_ms)} | {_time(lap.sector1_ms)} | {_time(lap.sector2_ms)} | {len(lap.samples)} | {coverage} | {_setup(lap.setup)} | {note} |")
-    lines.extend(["", "## Trace observations", ""])
+    lines.extend(["", "## Full setup snapshots", ""])
+    for lap in laps:
+        lines.extend([f"### Lap {lap.number}", ""])
+        for row in setup_rows(lap.setup):
+            value = "unknown" if row["value"] is None else f"{row['value']}{(' ' + row['unit']) if row['unit'] else ''}"
+            source = "manually supplied" if row["source"] == "manual" else "decoded from UDP" if row["source"] else "unknown"
+            lines.append(f"- {row['label']}: {value} — {source}")
+        lines.append("")
+    lines.extend(["## Trace observations", ""])
     for lap in laps:
         quality = lap_quality(lap)
         lines.extend([
@@ -97,7 +104,7 @@ def build_markdown(session: Any, laps: list[Any], notes: dict[str, str], track_l
             lines.append(f"- Lap {candidate.number} vs fastest included lap {baseline.number}: {delta:+.3f} s (candidate − baseline).")
         if not compared:
             lines.append("Included valid laps are not compatible under the race/Time Trial and track rules.")
-    lines.extend(["", "## Interpretation limits", "", "- Observations are calculated from recorded traces; they do not establish that a setup change caused a time change.", "- Missing values are labelled unavailable. Legacy coverage is an approximation when lap distance was not recorded.", ""])
+    lines.extend(["", "## Interpretation limits", "", "- Observations are calculated from recorded traces; they do not establish that a setup change caused a time change.", "- Missing historical setup values are labelled unknown and are never inferred from measured tyre telemetry or defaults. Legacy coverage is an approximation when lap distance was not recorded.", ""])
     return "\n".join(lines)
 
 

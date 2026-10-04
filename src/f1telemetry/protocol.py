@@ -125,15 +125,36 @@ def decode_player_lap_data(data: bytes, header: PacketHeader) -> dict[str, Any] 
     }
 
 
-def decode_player_setup(data: bytes, header: PacketHeader) -> dict[str, int] | None:
+def decode_player_setup(data: bytes, header: PacketHeader) -> dict[str, int | float] | None:
     offset = _player_offset(header, CAR_SETUP_SIZE, data)
     if offset is None:
         return None
+    front_camber, rear_camber, front_toe, rear_toe = struct.unpack_from("<4f", data, offset + 4)
+    rear_left, rear_right, front_left, front_right = struct.unpack_from("<4f", data, offset + 29)
     return {
         "front_wing": data[offset],
         "rear_wing": data[offset + 1],
         "on_throttle_diff": data[offset + 2],
         "off_throttle_diff": data[offset + 3],
+        "front_camber": round(front_camber, 3),
+        "rear_camber": round(rear_camber, 3),
+        "front_toe": round(front_toe, 3),
+        "rear_toe": round(rear_toe, 3),
+        "front_suspension": data[offset + 20],
+        "rear_suspension": data[offset + 21],
+        "front_anti_roll_bar": data[offset + 22],
+        "rear_anti_roll_bar": data[offset + 23],
+        "front_ride_height": data[offset + 24],
+        "rear_ride_height": data[offset + 25],
+        "brake_pressure": data[offset + 26],
+        "brake_bias": data[offset + 27],
+        "engine_braking": data[offset + 28],
+        "rear_left_tyre_pressure_psi": round(rear_left, 3),
+        "rear_right_tyre_pressure_psi": round(rear_right, 3),
+        "front_left_tyre_pressure_psi": round(front_left, 3),
+        "front_right_tyre_pressure_psi": round(front_right, 3),
+        "ballast": data[offset + 45],
+        "fuel_load_kg": round(struct.unpack_from("<f", data, offset + 46)[0], 3),
     }
 
 

@@ -24,7 +24,9 @@ If port `8025` is already in use, an earlier copy is probably running. Open the 
 | UDP Format | `2025` |
 | UDP Broadcast Mode | Off |
 
-The decoder validates F1 25 format `2025` and Session packet version `1`. Session type `18` is treated as Time Trial; types `15–17` are races. Track identity comes from the game rather than being assumed.
+The decoder validates F1 25 format `2025` and Session packet version `1`. Session type `18` is treated as Time Trial; types `15–17` are races. Track identity comes from the game rather than being assumed. The official F1 25 track appendix is built in: Silverstone is ID `7`, while its reverse layout is the independent ID `39` (Austria/Zandvoort reverse are `40`/`41`). Unrecognised IDs appear as `Unknown track (ID n)`.
+
+Packet ID `5` is decoded using the complete packed 50-byte `CarSetupData` stride. Setup snapshots include aero, both differential settings, signed camber/toe floats, suspension, anti-roll bars, ride heights, brakes, engine braking, the four configured tyre pressures with explicit wheel names, ballast, and fuel load. These pressures are setup values and are never substituted with measured Car Telemetry pressures. Older four-field files remain valid; all absent settings display as `unknown`.
 
 ## Recording workflows
 
@@ -49,7 +51,7 @@ Changing setup during a lap does not relabel that lap: each completed lap retain
 
 The displayed session controls the **Session** table and the default Lap Analysis choices. Selecting an old session is read-only inspection and never resumes it. Live telemetry remains live while historical data is displayed. Use **Jump to active session** to return to the current recording.
 
-Sessions can be renamed without changing their IDs or lap files. Per-lap notes continue to use `data/notes.json`. A recording open during application shutdown or a crash is marked `interrupted` when loaded again.
+Sessions can be renamed without changing their IDs or lap files. If an ID is absent from the official appendix, a separate circuit display-name override is available; it does not alter the numeric identity, PB key, or compatibility rules. Per-lap notes continue to use `data/notes.json`. A recording open during application shutdown or a crash is marked `interrupted` when loaded again.
 
 Storage layout:
 
@@ -59,6 +61,7 @@ data/
   notes.json                         Per-lap notes, when used
   personal_bests/
     track-<id>__<mode>.json          Atomic full-fidelity winning-lap copies
+  audit/setup-amendments/<lap>/<id>/ Exact original lap/PB and amendment manifest
   sessions/
     session-<timestamp>-<suffix>/
       session.json                   Name, mode, UID, track, status, lap IDs
@@ -76,6 +79,8 @@ In the **Session** view, use the checkbox beside each lap or **Select all/Clear*
 
 Invalid laps may be exported for setup review and are labelled `INVALID`. Reports label missing and estimated values and do not claim that a setup change caused a time change. Export generation is read-only and does not rewrite the source session.
 
+Use **Edit/Add setup** on a saved lap to enter a historical setup from the game or screenshots. Existing values are prepopulated; only changed/new fields are marked `manual`, while captured fields retain UDP provenance. Values are type/range checked. Before an amendment, exact originals of the source lap and any matching PB snapshot are placed in `data/audit/setup-amendments/`; then the lap and PB are updated with atomic replacement. Lap samples, official times, validity, and session identity are not edited. If no PB exists, the lap is corrected immediately and a later PB rebuild will copy it. Missing fields stay unknown—no balanced defaults are generated.
+
 ## Personal best registry
 
 Every newly completed lap is evaluated automatically. A PB update requires:
@@ -87,13 +92,15 @@ Every newly completed lap is evaluated automatically. A PB update requires:
 
 Slower, invalid, partial, legacy-distance, and unknown-track laps cannot replace a PB. Keys include actual track ID and mode, so race and Time Trial records are not mixed.
 
-Each PB file is an independent full copy of the winning lap: all telemetry samples and units, official times and sectors, setup snapshot, source IDs/session name, note/provenance, data-quality result, and the date it became PB. Updates use a temporary file plus atomic replacement and never mutate the source lap. Use **Rebuild from saved sessions** deliberately to consider historical session laps. A stored Time Trial PB can be selected as the baseline for a compatible future run.
+Each PB file is an independent full copy of the winning lap: all telemetry samples and units, official times and sectors, setup snapshot, source IDs/session name, note/provenance, data-quality result, and the date it became PB. Updates use a temporary file plus atomic replacement and never mutate the source lap. Use **Rebuild from saved sessions** deliberately to consider historical session laps. A stored compatible PB can be selected independently as either baseline or candidate.
 
 Back up `data/personal_bests/` together with `data/sessions/`. PB copies remain usable for comparison even if their original session is later unavailable.
 
 ## Lap comparison rules
 
 Delta is always `candidate − baseline`; negative means the candidate is faster.
+
+Baseline and candidate each have their own session/PB selector followed by a lap-number selector. Lap options show official time and validity. Selections survive the periodic dashboard refresh, and incompatibility is explained before the comparison request.
 
 - Valid race laps may be compared only within the same race recording.
 - Time Trial laps from separate runs may be compared when both have the same known track.
@@ -115,11 +122,14 @@ GET  /api/sessions/<session_id>/export?scope=session&format=markdown
 GET  /api/sessions/<session_id>/export?scope=selected&format=zip&lap=<lap_id>
 POST /api/sessions/select               {"session_id":"..."}
 POST /api/sessions/<session_id>/rename  {"name":"rear wing +1"}
+POST /api/sessions/<session_id>/track-name {"name":"Local circuit"}
 POST /api/runs/start                     {"name":"18/18 baseline"}
 POST /api/recording/stop
 GET  /api/laps[?session=<session_id>]
 GET  /api/laps/<lap_id>
 POST /api/laps/<lap_id>/note             {"note":"Stowe test"}
+GET  /api/setup-schema
+POST /api/laps/<lap_id>/setup            {"setup":{"front_camber":-3.5}}
 GET  /api/compare?baseline=<id>&candidate=<id>
 GET  /api/personal-bests
 GET  /api/personal-bests/<track-mode-key>
@@ -138,6 +148,5 @@ python3 -m py_compile src/f1telemetry/*.py
 ## Current limitations
 
 - Race-strategy prediction is not implemented.
-- Fuel, ERS, tyre wear/damage, tyre compound/age, gaps, positions, and pit windows await future packet decoders.
-- Track names other than normal Silverstone currently appear by numeric ID, although compatibility rules still use that ID correctly.
+- Live fuel burn, ERS, tyre wear/damage, tyre compound/age, gaps, positions, and pit windows await future packet decoders. Configured setup fuel load is decoded.
 - Restart Lap and flashback transitions are covered by synthetic regression tests, but real F1 25 driving is still required to confirm every packet-ordering variation and game mode.

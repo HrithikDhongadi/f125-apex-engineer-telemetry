@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
+from .circuits import is_known_track
 from .quality import lap_quality
 
 
@@ -33,10 +34,13 @@ class PersonalBestRegistry:
                 continue
 
     def _write(self, entry: dict[str, Any]) -> None:
-        destination = self.directory / f"{entry['key']}.json"
+        destination = self.path_for(str(entry["key"]))
         temporary = destination.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(entry, separators=(",", ":")), encoding="utf-8")
         temporary.replace(destination)
+
+    def path_for(self, key: str) -> Path:
+        return self.directory / f"{key}.json"
 
     def consider(
         self,
@@ -46,7 +50,7 @@ class PersonalBestRegistry:
         provenance: str = "Automatic completed-lap evaluation",
     ) -> dict[str, Any] | None:
         quality = lap_quality(lap)
-        if lap.track_id is None or lap.track_id < 0 or lap.mode not in {"race", "time_trial"} or not quality["adequate_for_pb"]:
+        if not is_known_track(lap.track_id) or lap.mode not in {"race", "time_trial"} or not quality["adequate_for_pb"]:
             return None
         key = pb_key(lap.track_id, lap.mode)
         current = self.entries.get(key)
@@ -85,6 +89,16 @@ class PersonalBestRegistry:
             if entry.get("source_lap_id") == lap_id:
                 entry["note"] = note
                 self._write(entry)
+
+    def update_source_setup(self, lap_id: str, setup: dict[str, Any]) -> bool:
+        updated = False
+        for entry in self.entries.values():
+            if entry.get("source_lap_id") == lap_id:
+                entry["setup"] = setup
+                entry["lap"]["setup"] = setup
+                self._write(entry)
+                updated = True
+        return updated
 
     def summaries(self) -> list[dict[str, Any]]:
         return [{key: value for key, value in entry.items() if key != "lap"} | {"comparison_id": f"pb:{entry['key']}"} for entry in self.entries.values()]

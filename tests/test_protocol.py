@@ -32,10 +32,30 @@ class ProtocolTests(unittest.TestCase):
     def test_setup_uses_the_documented_50_byte_stride(self):
         header = struct.pack("<HBBBBBQfIIBB", 2025, 25, 1, 0, 1, 5, 42, 10.5, 17, 17, 1, 255)
         first_car = bytes(50)
-        player_car = bytes([19, 15, 100, 30]) + bytes(46)
+        player_car = bytearray(50)
+        player_car[0:4] = bytes([19, 17, 20, 45])
+        struct.pack_into("<4f", player_car, 4, -3.5, -2.0, -0.05, 0.13)
+        player_car[20:29] = bytes([33, 16, 14, 8, 21, 46, 100, 56, 70])
+        struct.pack_into("<4f", player_car, 29, 21.1, 21.2, 24.1, 24.2)
+        player_car[45] = 7
+        struct.pack_into("<f", player_car, 46, 5.75)
         packet = header + first_car + player_car + bytes(50 * 20)
         setup = decode_player_setup(packet, decode_header(packet))
-        self.assertEqual(setup, {"front_wing": 19, "rear_wing": 15, "on_throttle_diff": 100, "off_throttle_diff": 30})
+        self.assertEqual(setup["front_wing"], 19)
+        self.assertEqual(setup["rear_wing"], 17)
+        self.assertEqual(setup["front_suspension"], 33)
+        self.assertEqual(setup["rear_ride_height"], 46)
+        self.assertEqual(setup["brake_pressure"], 100)
+        self.assertEqual(setup["brake_bias"], 56)
+        self.assertEqual(setup["engine_braking"], 70)
+        self.assertEqual(setup["ballast"], 7)
+        for key, expected in {
+            "front_camber": -3.5, "rear_camber": -2.0, "front_toe": -0.05, "rear_toe": 0.13,
+            "rear_left_tyre_pressure_psi": 21.1, "rear_right_tyre_pressure_psi": 21.2,
+            "front_left_tyre_pressure_psi": 24.1, "front_right_tyre_pressure_psi": 24.2,
+            "fuel_load_kg": 5.75,
+        }.items():
+            self.assertAlmostEqual(setup[key], expected, places=5, msg=key)
 
     def test_session_packet_decodes_mode_track_and_length(self):
         header = struct.pack("<HBBBBBQfIIBB", 2025, 25, 1, 0, 1, 1, 9876, 10.5, 17, 17, 0, 255)

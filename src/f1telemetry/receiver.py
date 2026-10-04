@@ -12,6 +12,7 @@ from time import monotonic
 from typing import Any
 from uuid import uuid4
 
+from .circuits import is_known_track, track_name
 from .protocol import (
     PACKET_CAR_SETUPS, PACKET_CAR_TELEMETRY, PACKET_EVENT, PACKET_LAP_DATA,
     PACKET_SESSION, decode_event_code, decode_header, decode_player_car_telemetry,
@@ -19,20 +20,14 @@ from .protocol import (
 )
 from .personal_bests import PersonalBestRegistry
 from .quality import lap_quality
+from .setups import SetupValidationError, setup_rows, validate_manual_values, with_provenance
 
 LEGACY_SESSION_ID = "legacy"
-TRACK_NAMES = {7: "Silverstone"}
 OPEN_STATUSES = {"armed", "recording"}
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def track_name(track_id: int | None) -> str:
-    if track_id is None or track_id < 0:
-        return "Unknown track"
-    return TRACK_NAMES.get(track_id, f"Track {track_id}")
 
 
 @dataclass
@@ -41,7 +36,7 @@ class Lap:
     time_ms: int
     invalid: bool
     samples: list[dict[str, Any]] = field(default_factory=list)
-    setup: dict[str, int] | None = None
+    setup: dict[str, Any] | None = None
     saved_at: str = ""
     sector1_ms: int | None = None
     sector2_ms: int | None = None
@@ -92,13 +87,16 @@ class RecordingSession:
     track_id: int | None
     track_length_m: int | None
     lap_ids: list[str] = field(default_factory=list)
+    track_name_override: str | None = None
 
     def summary(self, laps: list[Lap]) -> dict[str, Any]:
         valid = [lap.time_ms for lap in laps if not lap.invalid]
         return {
             **asdict(self), "lap_count": len(laps),
             "best_valid_lap_ms": min(valid) if valid else None,
-            "track_name": track_name(self.track_id),
+            "track_name": track_name(self.track_id, self.track_name_override),
+            "official_track_name": track_name(self.track_id) if is_known_track(self.track_id) else None,
+            "can_override_track_name": not is_known_track(self.track_id),
             "read_only": self.id == LEGACY_SESSION_ID,
         }
 
@@ -161,12 +159,12 @@ class SessionStore:
         self.active_recording_id: str | None = None
         self.selected_session_id: str | None = None
         self.manual_stop_uid: int | None = None
-        self.current_setup: dict[str, int] | None = None
+        self.current_setup: dict[str, Any] | None = None
         self.active_lap_number: int | None = None
         self.active_invalid = False
         self.active_samples: list[dict[str, Any]] = []
         self.active_lap_state: dict[str, Any] = {}
-        self.active_lap_setup: dict[str, int] | None = None
+        self.active_lap_setup: dict[str, Any] | None = None
         self.capture_current_lap = False
         self._load_all()
 
@@ -370,6 +368,22 @@ class SessionStore:
             self._persist_session(session)
             return session.summary(self.session_laps[session.id])
 
+    def override_track_name(self, session_id: str, name: str) -> dict[str, Any]:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise SessionStateError("Unknown session ID")
+            if session.id == LEGACY_SESSION_ID:
+                raise SessionStateError("Legacy captures are read-only")
+            if is_known_track(session.track_id):
+                raise SessionStateError("Official circuit names cannot be overridden")
+            clean = name.strip()[:80]
+            if not clean:
+                raise SessionStateError("Circuit display name cannot be empty")
+            session.track_name_override = clean
+            self._persist_session(session)
+            return session.summary(self.session_laps[session.id])
+
     def select_session(self, session_id: str) -> dict[str, Any]:
         with self.lock:
             session = self.sessions.get(session_id)
@@ -378,18 +392,19 @@ class SessionStore:
             self.selected_session_id = session_id
             return session.summary(self.session_laps[session_id])
 
-    def record_setup(self, setup: dict[str, int], session_uid: int | None = None) -> None:
+    def record_setup(self, setup: dict[str, Any], session_uid: int | None = None) -> None:
         with self.lock:
             self._observe_uid(session_uid)
-            self.current_setup = dict(setup)
+            decoded = with_provenance(setup, "decoded_udp") or {}
+            self.current_setup = decoded
             if (
                 self.capture_current_lap
                 and self.active_lap_setup is None
                 and float(self.active_lap_state.get("current_lap_ms", 0)) <= 1_500
             ):
-                self.active_lap_setup = dict(setup)
+                self.active_lap_setup = dict(decoded)
             self.latest.update(setup)
-            self.latest["setup"] = dict(setup)
+            self.latest["setup"] = dict(decoded)
             self._touch()
 
     def _reset_lap(self) -> None:
@@ -501,7 +516,7 @@ class SessionStore:
         payload = asdict(lap)
         payload["sample_count"] = len(lap.samples)
         directory = self.sessions_dir / session.id
-        (directory / f"{lap.id}.json").write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        self._atomic_json(directory / f"{lap.id}.json", payload, compact=True)
         self._persist_session(session)
         self.pb_registry.consider(lap, session.name, self.notes.get(lap.id, ""))
 
@@ -547,8 +562,81 @@ class SessionStore:
         with self.lock:
             lap = self.get_lap_object(lap_id)
             if lap:
-                return asdict(lap) | {"id": lap.id, "sample_count": len(lap.samples), "note": self.notes.get(lap.id, "")}
+                return asdict(lap) | {
+                    "id": lap.id, "sample_count": len(lap.samples), "note": self.notes.get(lap.id, ""),
+                    "setup_fields": setup_rows(lap.setup),
+                }
         return None
+
+    @staticmethod
+    def _atomic_json(path: Path, payload: dict[str, Any], compact: bool = False) -> None:
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        temporary.write_text(
+            json.dumps(payload, separators=(",", ":")) if compact else json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def amend_lap_setup(self, lap_id: str, values: Any) -> dict[str, Any]:
+        """Amend only setup metadata, retaining exact pre-change lap/PB backups."""
+        clean = validate_manual_values(values)
+        with self.lock:
+            lap = next((item for item in self.laps if item.id == lap_id), None)
+            if lap is None:
+                raise SessionStateError("Lap not found")
+            lap_path = self.capture_dir / f"{lap.id}.json" if lap.recording_session_id == LEGACY_SESSION_ID else self.sessions_dir / lap.recording_session_id / f"{lap.id}.json"
+            try:
+                original_lap = lap_path.read_bytes()
+                lap_payload = json.loads(original_lap)
+            except (OSError, ValueError, TypeError) as error:
+                raise SessionStateError("Original lap JSON is unavailable or invalid") from error
+
+            current = with_provenance(lap.setup, "legacy_decoded_udp") or {"_provenance": {}}
+            changed = {key: value for key, value in clean.items() if current.get(key) != value}
+            if not changed:
+                raise SetupValidationError("No setup values changed")
+
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            audit_dir = self.capture_dir / "audit" / "setup-amendments" / lap.id / stamp
+            audit_dir.mkdir(parents=True, exist_ok=False)
+            (audit_dir / "original-lap.json").write_bytes(original_lap)
+
+            pb_entry = next((entry for entry in self.pb_registry.entries.values() if entry.get("source_lap_id") == lap.id), None)
+            pb_path = None
+            if pb_entry is not None:
+                pb_path = self.pb_registry.path_for(str(pb_entry["key"]))
+                try:
+                    (audit_dir / "original-personal-best.json").write_bytes(pb_path.read_bytes())
+                except OSError as error:
+                    raise SessionStateError("PB record exists but cannot be backed up; no files were changed") from error
+
+            provenance = dict(current.get("_provenance") or {})
+            current.update(changed)
+            provenance.update({key: "manual" for key in changed})
+            current["_provenance"] = provenance
+            current["_amended_at"] = utc_now()
+            current["_audit_record"] = str(audit_dir.relative_to(self.capture_dir))
+            manifest = {
+                "lap_id": lap.id, "source_session_id": lap.recording_session_id,
+                "created_at": current["_amended_at"], "changed_fields": changed,
+                "preserved_fields": {key: value for key, value in (lap.setup or {}).items() if not key.startswith("_") and key not in changed},
+                "pb_key": pb_entry.get("key") if pb_entry else None,
+            }
+            (audit_dir / "amendment.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+            lap_payload["setup"] = current
+            self._atomic_json(lap_path, lap_payload, compact=True)
+            lap.setup = current
+            pb_synced = False
+            if pb_entry is not None:
+                self.pb_registry.update_source_setup(lap.id, current)
+                pb_synced = True
+            return {
+                "lap": lap.summary(self.notes.get(lap.id, "")), "setup_fields": setup_rows(current),
+                "changed_fields": list(changed), "pb_synced": pb_synced,
+                "pb_message": "Personal best snapshot synchronized" if pb_synced else "No PB snapshot found; the corrected lap will sync when the PB registry is built",
+                "audit_record": str(audit_dir.relative_to(self.capture_dir)),
+            }
 
     def set_note(self, lap_id: str, note: str) -> dict[str, Any] | None:
         with self.lock:
@@ -613,7 +701,7 @@ class SessionStore:
                 raise ExportError("Export scope must be 'session' or 'selected'")
             if not included:
                 raise ExportError("This export contains no completed laps")
-            report = build_markdown(session, included, self.notes, track_name(session.track_id))
+            report = build_markdown(session, included, self.notes, track_name(session.track_id, session.track_name_override))
             base = safe_filename(session.name)
             if export_format == "markdown":
                 return f"{base}.md", "text/markdown; charset=utf-8", report.encode("utf-8")

@@ -129,6 +129,19 @@ class RecordingSessionTests(unittest.TestCase):
             self.assertEqual(store.sessions[LEGACY_SESSION_ID].status, "legacy")
             self.assertEqual(len(store.session_laps[LEGACY_SESSION_ID]), 1)
 
+    def test_old_four_field_setup_loads_without_inventing_missing_values(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "lap-20250101T000000Z-1.json"
+            payload = {
+                "number": 1, "time_ms": 90_000, "invalid": False, "samples": [],
+                "saved_at": "20250101T000000Z",
+                "setup": {"front_wing": 19, "rear_wing": 17, "on_throttle_diff": 20, "off_throttle_diff": 45},
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            lap = SessionStore(Path(directory)).session_laps[LEGACY_SESSION_ID][0]
+            self.assertEqual(lap.setup, payload["setup"])
+            self.assertNotIn("front_camber", lap.setup)
+
     def test_setup_is_snapshotted_at_lap_start(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
@@ -144,7 +157,53 @@ class RecordingSessionTests(unittest.TestCase):
             for index in range(15, 30):
                 store.record_telemetry(telemetry(), index, UID)
             store.record_lap_state(lap_state(2, 0, 0, 90_000), UID)
-            self.assertEqual(store.session_laps[run["id"]][0].setup, first_setup)
+            captured = store.session_laps[run["id"]][0].setup
+            self.assertEqual({key: captured[key] for key in first_setup}, first_setup)
+            self.assertTrue(all(captured["_provenance"][key] == "decoded_udp" for key in first_setup))
+
+    def test_historical_setup_amendment_backs_up_and_syncs_pb(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.record_game_session(game())
+            original_setup = {"front_wing": 19, "rear_wing": 17, "on_throttle_diff": 20, "off_throttle_diff": 45}
+            store.record_setup(original_setup, UID)
+            store.record_lap_state(lap_state(18), UID)
+            run = store.start_time_trial_run("Silverstone PB")
+            fill_lap(store, UID, 18, 88_617)
+            lap = store.session_laps[run["id"]][0]
+            lap_path = root / "sessions" / run["id"] / f"{lap.id}.json"
+            original_bytes = lap_path.read_bytes()
+            original_payload = json.loads(original_bytes)
+            result = store.amend_lap_setup(lap.id, {
+                "front_camber": -3.5, "rear_camber": -2.0, "front_left_tyre_pressure_psi": 24.0,
+                "front_right_tyre_pressure_psi": 24.0, "rear_left_tyre_pressure_psi": 21.1,
+                "rear_right_tyre_pressure_psi": 21.1, "fuel_load_kg": 5.0,
+            })
+            amended = json.loads(lap_path.read_text())
+            audit = root / result["audit_record"]
+            self.assertEqual((audit / "original-lap.json").read_bytes(), original_bytes)
+            self.assertEqual(amended["samples"], original_payload["samples"])
+            self.assertEqual(amended["time_ms"], 88_617)
+            self.assertEqual(amended["recording_session_id"], run["id"])
+            self.assertEqual(amended["setup"]["front_wing"], 19)
+            self.assertEqual(amended["setup"]["_provenance"]["front_wing"], "decoded_udp")
+            self.assertEqual(amended["setup"]["_provenance"]["front_camber"], "manual")
+            self.assertTrue(result["pb_synced"])
+            pb = store.personal_best("track-7__time_trial")
+            self.assertEqual(pb["setup"], amended["setup"])
+            self.assertEqual(pb["lap"]["setup"], amended["setup"])
+
+    def test_unknown_track_display_override_preserves_numeric_identity(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(track_id=99))
+            store.record_lap_state(lap_state(1), UID)
+            run = store.start_time_trial_run("unknown circuit")
+            self.assertEqual(store.sessions[run["id"]].summary([])["track_name"], "Unknown track (ID 99)")
+            summary = store.override_track_name(run["id"], "My local circuit")
+            self.assertEqual(summary["track_name"], "My local circuit")
+            self.assertEqual(summary["track_id"], 99)
 
     def test_restart_lap_with_zero_last_time_captures_next_full_lap(self):
         with TemporaryDirectory() as directory:

@@ -1,4 +1,4 @@
-"""UDP receiver, session state, and durable local lap recording."""
+"""UDP receiver, persistent recording sessions, and local lap storage."""
 
 from __future__ import annotations
 
@@ -10,11 +10,27 @@ import socket
 from threading import Event, Lock, Thread
 from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from .protocol import (
-    PACKET_CAR_SETUPS, PACKET_CAR_TELEMETRY, PACKET_LAP_DATA,
-    decode_header, decode_player_car_telemetry, decode_player_lap_data, decode_player_setup,
+    PACKET_CAR_SETUPS, PACKET_CAR_TELEMETRY, PACKET_EVENT, PACKET_LAP_DATA,
+    PACKET_SESSION, decode_event_code, decode_header, decode_player_car_telemetry,
+    decode_player_lap_data, decode_player_setup, decode_session,
 )
+
+LEGACY_SESSION_ID = "legacy"
+TRACK_NAMES = {7: "Silverstone"}
+OPEN_STATUSES = {"armed", "recording"}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def track_name(track_id: int | None) -> str:
+    if track_id is None or track_id < 0:
+        return "Unknown track"
+    return TRACK_NAMES.get(track_id, f"Track {track_id}")
 
 
 @dataclass
@@ -33,6 +49,11 @@ class Lap:
     minimum_speed_kph: int | None = None
     max_brake_temps_c: list[int] | None = None
     max_tyre_inner_c: list[int] | None = None
+    recording_session_id: str = LEGACY_SESSION_ID
+    game_session_uid: int | None = None
+    mode: str = "unknown"
+    track_id: int | None = None
+    track_length_m: int | None = None
 
     @property
     def id(self) -> str:
@@ -50,6 +71,32 @@ class Lap:
             "minimum_speed_kph": self.minimum_speed_kph,
             "max_brake_temps_c": self.max_brake_temps_c,
             "max_tyre_inner_c": self.max_tyre_inner_c, "note": note,
+            "recording_session_id": self.recording_session_id,
+            "game_session_uid": self.game_session_uid, "mode": self.mode,
+            "track_id": self.track_id, "track_length_m": self.track_length_m,
+        }
+
+
+@dataclass
+class RecordingSession:
+    id: str
+    name: str
+    mode: str
+    started_at: str
+    ended_at: str | None
+    status: str
+    game_session_uid: int | None
+    track_id: int | None
+    track_length_m: int | None
+    lap_ids: list[str] = field(default_factory=list)
+
+    def summary(self, laps: list[Lap]) -> dict[str, Any]:
+        valid = [lap.time_ms for lap in laps if not lap.invalid]
+        return {
+            **asdict(self), "lap_count": len(laps),
+            "best_valid_lap_ms": min(valid) if valid else None,
+            "track_name": track_name(self.track_id),
+            "read_only": self.id == LEGACY_SESSION_ID,
         }
 
 
@@ -62,15 +109,11 @@ def _positive(value: Any) -> int | None:
 
 
 def _wheel_max(samples: list[dict[str, Any]], key: str) -> list[int] | None:
-    rows = [
-        values for sample in samples
-        if isinstance((values := sample.get(key)), (list, tuple)) and len(values) == 4
-    ]
+    rows = [values for sample in samples if isinstance((values := sample.get(key)), (list, tuple)) and len(values) == 4]
     return [max(int(row[index]) for row in rows) for index in range(4)] if rows else None
 
 
 def enrich_lap(lap: Lap) -> Lap:
-    """Fill derived metadata, including for captures written by v0.1."""
     speeds = [int(sample["speed_kph"]) for sample in lap.samples if sample.get("speed_kph") is not None]
     times = [float(sample["t"]) for sample in lap.samples if sample.get("t") is not None]
     if lap.first_session_time is None and times:
@@ -88,21 +131,40 @@ def enrich_lap(lap: Lap) -> Lap:
     return lap
 
 
+class SessionStateError(ValueError):
+    pass
+
+
 class SessionStore:
     def __init__(self, capture_dir: Path) -> None:
         self.capture_dir = capture_dir
         self.capture_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir = self.capture_dir / "sessions"
+        self.sessions_dir.mkdir(exist_ok=True)
         self.notes_path = self.capture_dir / "notes.json"
         self.lock = Lock()
+        self.latest: dict[str, Any] = {"connected": False}
+        self.last_packet_at: float | None = None
+        self.notes = self._load_notes()
+        self.sessions: dict[str, RecordingSession] = {}
+        self.session_laps: dict[str, list[Lap]] = {}
+        self.laps: list[Lap] = []
+        self.game_session_uid: int | None = None
+        self.game_mode = "unknown"
+        self.game_session_type: int | None = None
+        self.track_id: int | None = None
+        self.track_length_m: int | None = None
+        self.active_recording_id: str | None = None
+        self.selected_session_id: str | None = None
+        self.manual_stop_uid: int | None = None
+        self.current_setup: dict[str, int] | None = None
         self.active_lap_number: int | None = None
         self.active_invalid = False
         self.active_samples: list[dict[str, Any]] = []
         self.active_lap_state: dict[str, Any] = {}
-        self.current_setup: dict[str, int] | None = None
-        self.latest: dict[str, Any] = {"connected": False}
-        self.last_packet_at: float | None = None
-        self.notes = self._load_notes()
-        self.laps = self._load_laps()
+        self.active_lap_setup: dict[str, int] | None = None
+        self.capture_current_lap = False
+        self._load_all()
 
     def _load_notes(self) -> dict[str, str]:
         try:
@@ -111,86 +173,339 @@ class SessionStore:
         except (OSError, ValueError, TypeError):
             return {}
 
-    def _load_laps(self) -> list[Lap]:
-        laps: list[Lap] = []
+    @staticmethod
+    def _lap_from_payload(payload: dict[str, Any], defaults: dict[str, Any] | None = None) -> Lap:
         allowed = {item.name for item in fields(Lap)}
+        values = dict(defaults or {})
+        values.update({key: value for key, value in payload.items() if key in allowed})
+        return enrich_lap(Lap(**values))
+
+    def _load_all(self) -> None:
+        legacy_laps: list[Lap] = []
         for path in sorted(self.capture_dir.glob("lap-*.json")):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-                lap = Lap(**{key: value for key, value in payload.items() if key in allowed})
-                laps.append(enrich_lap(lap))
+                legacy_laps.append(self._lap_from_payload(payload, {"recording_session_id": LEGACY_SESSION_ID}))
             except (OSError, ValueError, TypeError, KeyError):
                 continue
-        return laps
+        self.sessions[LEGACY_SESSION_ID] = RecordingSession(
+            LEGACY_SESSION_ID, "Legacy captures", "unknown", "", None, "legacy", None, None, None,
+            [lap.id for lap in legacy_laps],
+        )
+        self.session_laps[LEGACY_SESSION_ID] = legacy_laps
 
-    def record_setup(self, setup: dict[str, int]) -> None:
+        session_fields = {item.name for item in fields(RecordingSession)}
+        for metadata_path in sorted(self.sessions_dir.glob("*/session.json")):
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                session = RecordingSession(**{key: value for key, value in payload.items() if key in session_fields})
+                laps = []
+                for lap_path in sorted(metadata_path.parent.glob("lap-*.json")):
+                    lap_payload = json.loads(lap_path.read_text(encoding="utf-8"))
+                    defaults = {
+                        "recording_session_id": session.id, "game_session_uid": session.game_session_uid,
+                        "mode": session.mode, "track_id": session.track_id, "track_length_m": session.track_length_m,
+                    }
+                    laps.append(self._lap_from_payload(lap_payload, defaults))
+                session.lap_ids = [lap.id for lap in laps]
+                if session.status in OPEN_STATUSES:
+                    session.status, session.ended_at = "interrupted", utc_now()
+                    self.sessions[session.id] = session
+                    self.session_laps[session.id] = laps
+                    self._persist_session(session)
+                else:
+                    self.sessions[session.id] = session
+                    self.session_laps[session.id] = laps
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+        self._refresh_lap_index()
+        real_sessions = [session for session in self.sessions.values() if session.id != LEGACY_SESSION_ID]
+        if real_sessions:
+            self.selected_session_id = max(real_sessions, key=lambda item: item.started_at).id
+        else:
+            self.selected_session_id = LEGACY_SESSION_ID
+
+    def _refresh_lap_index(self) -> None:
+        self.laps = [lap for laps in self.session_laps.values() for lap in laps]
+
+    def _persist_session(self, session: RecordingSession) -> None:
+        directory = self.sessions_dir / session.id
+        directory.mkdir(parents=True, exist_ok=True)
+        temporary = directory / "session.json.tmp"
+        temporary.write_text(json.dumps(asdict(session), indent=2), encoding="utf-8")
+        temporary.replace(directory / "session.json")
+
+    def _touch(self) -> None:
+        self.latest["connected"] = True
+        self.last_packet_at = monotonic()
+
+    def _observe_uid(self, session_uid: int | None) -> None:
+        if session_uid is None:
+            return
+        if self.game_session_uid is None:
+            self.game_session_uid = session_uid
+            return
+        if session_uid == self.game_session_uid:
+            return
+        self._close_active("completed")
+        self._reset_lap()
+        self.game_session_uid = session_uid
+        self.game_mode, self.game_session_type = "unknown", None
+        self.track_id, self.track_length_m = None, None
+        self.current_setup = None
+        self.manual_stop_uid = None
+        for key in (
+            "setup", "front_wing", "rear_wing", "on_throttle_diff", "off_throttle_diff",
+            "lap_number", "current_lap_ms", "lap_distance_m", "invalid",
+        ):
+            self.latest.pop(key, None)
+
+    def record_game_session(self, game: dict[str, Any]) -> None:
         with self.lock:
+            self._observe_uid(int(game["session_uid"]))
+            self.game_session_uid = int(game["session_uid"])
+            self.game_mode = str(game["mode"])
+            self.game_session_type = int(game["session_type"])
+            self.track_id = int(game["track_id"])
+            self.track_length_m = int(game["track_length_m"])
+            self.latest.update({
+                "game_session_uid": self.game_session_uid, "game_mode": self.game_mode,
+                "session_type": self.game_session_type, "track_id": self.track_id,
+                "track_length_m": self.track_length_m, "track_name": track_name(self.track_id),
+            })
+            self._touch()
+            if self.game_mode == "race" and self.active_recording_id is None and self.manual_stop_uid != self.game_session_uid:
+                self._create_recording(f"Race · {track_name(self.track_id)}", "race", automatic=True)
+
+    def game_session_ended(self, session_uid: int) -> None:
+        with self.lock:
+            if self.game_session_uid == session_uid:
+                self._close_active("completed")
+                self._reset_lap()
+                self.manual_stop_uid = session_uid
+
+    def _at_lap_start(self) -> bool:
+        if self.active_lap_number is None:
+            return True
+        return (
+            float(self.active_lap_state.get("current_lap_ms", 999_999)) <= 1_500
+            and float(self.active_lap_state.get("lap_distance_m", 999_999)) <= 100
+        )
+
+    def _create_recording(self, name: str, mode: str, automatic: bool = False) -> RecordingSession:
+        if self.active_recording_id is not None:
+            raise SessionStateError("A recording session is already active")
+        now = datetime.now(timezone.utc)
+        session_id = f"session-{now.strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:8]}"
+        at_start = self._at_lap_start()
+        session = RecordingSession(
+            id=session_id, name=name.strip()[:80] or ("Time Trial run" if mode == "time_trial" else "Race"),
+            mode=mode, started_at=now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+            ended_at=None, status="recording" if at_start else "armed",
+            game_session_uid=self.game_session_uid, track_id=self.track_id,
+            track_length_m=self.track_length_m, lap_ids=[],
+        )
+        self.sessions[session.id], self.session_laps[session.id] = session, []
+        self.active_recording_id = session.id
+        if not automatic:
+            self.selected_session_id = session.id
+        elif self.selected_session_id is None:
+            self.selected_session_id = session.id
+        self.capture_current_lap = at_start
+        self.active_samples = []
+        if at_start and self.active_lap_number is not None:
+            self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
+            self.active_invalid = bool(self.active_lap_state.get("invalid", False))
+        self._persist_session(session)
+        return session
+
+    def start_time_trial_run(self, name: str) -> dict[str, Any]:
+        with self.lock:
+            if self.game_mode != "time_trial" or self.game_session_uid is None:
+                raise SessionStateError("Start new run is available only after a Time Trial Session packet is received")
+            session = self._create_recording(name, "time_trial")
+            return session.summary([])
+
+    def stop_recording(self) -> dict[str, Any]:
+        with self.lock:
+            if self.active_recording_id is None:
+                raise SessionStateError("No recording session is active")
+            session = self.sessions[self.active_recording_id]
+            if session.mode == "race":
+                self.manual_stop_uid = session.game_session_uid
+            self._close_active("stopped")
+            self.active_samples = []
+            self.capture_current_lap = False
+            return session.summary(self.session_laps[session.id])
+
+    def interrupt_active(self) -> None:
+        with self.lock:
+            self._close_active("interrupted")
+
+    def _close_active(self, status: str) -> None:
+        if self.active_recording_id is None:
+            return
+        session = self.sessions[self.active_recording_id]
+        session.status, session.ended_at = status, utc_now()
+        self._persist_session(session)
+        self.active_recording_id = None
+        self.capture_current_lap = False
+        self.active_samples = []
+
+    def rename_session(self, session_id: str, name: str) -> dict[str, Any]:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise SessionStateError("Unknown session ID")
+            if session.id == LEGACY_SESSION_ID:
+                raise SessionStateError("Legacy captures are read-only")
+            clean = name.strip()[:80]
+            if not clean:
+                raise SessionStateError("Session name cannot be empty")
+            session.name = clean
+            self._persist_session(session)
+            return session.summary(self.session_laps[session.id])
+
+    def select_session(self, session_id: str) -> dict[str, Any]:
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise SessionStateError("Unknown session ID")
+            self.selected_session_id = session_id
+            return session.summary(self.session_laps[session_id])
+
+    def record_setup(self, setup: dict[str, int], session_uid: int | None = None) -> None:
+        with self.lock:
+            self._observe_uid(session_uid)
             self.current_setup = dict(setup)
+            if (
+                self.capture_current_lap
+                and self.active_lap_setup is None
+                and float(self.active_lap_state.get("current_lap_ms", 0)) <= 1_500
+            ):
+                self.active_lap_setup = dict(setup)
             self.latest.update(setup)
             self.latest["setup"] = dict(setup)
-            self.latest["connected"] = True
-            self.last_packet_at = monotonic()
+            self._touch()
 
-    def record_lap_state(self, lap_state: dict[str, Any]) -> None:
+    def _reset_lap(self) -> None:
+        self.active_lap_number = None
+        self.active_invalid = False
+        self.active_samples = []
+        self.active_lap_state = {}
+        self.active_lap_setup = None
+        self.capture_current_lap = False
+
+    def _begin_lap(self, lap_number: int, capture: bool) -> None:
+        self.active_lap_number = lap_number
+        self.active_invalid = False
+        self.active_samples = []
+        self.active_lap_state = {}
+        self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
+        self.capture_current_lap = capture
+
+    def record_lap_state(self, lap_state: dict[str, Any], session_uid: int | None = None) -> None:
         with self.lock:
-            lap_number = lap_state["lap_number"]
+            self._observe_uid(session_uid)
+            lap_number = int(lap_state["lap_number"])
             if self.active_lap_number is None:
-                self.active_lap_number = lap_number
+                recording = self.active_recording_id is not None and self.sessions[self.active_recording_id].status == "recording"
+                self._begin_lap(lap_number, recording)
             elif lap_number != self.active_lap_number:
-                self._finish_lap(lap_state["last_lap_ms"])
-                self.active_lap_number = lap_number
-                self.active_invalid = False
-                self.active_samples = []
-                self.active_lap_state = {}
-            self.active_invalid = self.active_invalid or lap_state["invalid"]
+                normal_crossing = (
+                    lap_number > self.active_lap_number
+                    and int(lap_state.get("last_lap_ms", 0)) >= 30_000
+                    and int(lap_state.get("current_lap_ms", 0)) <= 5_000
+                )
+                if normal_crossing and self.capture_current_lap:
+                    self._finish_lap(int(lap_state["last_lap_ms"]))
+                if normal_crossing and self.active_recording_id is not None:
+                    session = self.sessions[self.active_recording_id]
+                    if session.status == "armed":
+                        session.status = "recording"
+                        self._persist_session(session)
+                    capture = session.status == "recording"
+                else:
+                    capture = False
+                self._begin_lap(lap_number, capture)
+            else:
+                old_time = self.active_lap_state.get("current_lap_ms")
+                old_distance = self.active_lap_state.get("lap_distance_m")
+                time_reversed = old_time is not None and int(lap_state.get("current_lap_ms", 0)) + 1_000 < int(old_time)
+                distance_reversed = old_distance is not None and float(lap_state.get("lap_distance_m", 0)) + 50 < float(old_distance)
+                if time_reversed or distance_reversed:
+                    self.active_samples = []
+                    self.active_invalid = False
+                    self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
+                    self.capture_current_lap = False
+            self.active_invalid = self.active_invalid or bool(lap_state["invalid"])
             self.active_lap_state.update(lap_state)
             self.latest.update(lap_state)
-            self.latest["connected"] = True
-            self.last_packet_at = monotonic()
+            self._touch()
 
-    def record_telemetry(self, telemetry: dict[str, Any], session_time: float) -> None:
+    def record_telemetry(self, telemetry: dict[str, Any], session_time: float, session_uid: int | None = None) -> None:
         with self.lock:
+            self._observe_uid(session_uid)
             sample = {
-                "t": round(session_time, 3),
-                "lap_distance_m": self.active_lap_state.get("lap_distance_m"),
-                "current_lap_ms": self.active_lap_state.get("current_lap_ms"),
-                **telemetry,
+                "t": round(session_time, 3), "lap_distance_m": self.active_lap_state.get("lap_distance_m"),
+                "current_lap_ms": self.active_lap_state.get("current_lap_ms"), **telemetry,
             }
-            if self.active_lap_number is not None:
+            if self.capture_current_lap and self.active_lap_number is not None:
                 self.active_samples.append(sample)
             self.latest.update(sample)
-            self.latest["connected"] = True
-            self.last_packet_at = monotonic()
+            self._touch()
 
     def _finish_lap(self, time_ms: int) -> None:
-        if time_ms < 30_000 or len(self.active_samples) < 30:
+        if self.active_recording_id is None or time_ms < 30_000 or len(self.active_samples) < 30:
+            return
+        session = self.sessions[self.active_recording_id]
+        if session.game_session_uid != self.game_session_uid:
             return
         state = self.active_lap_state
+        saved_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         lap = enrich_lap(Lap(
-            number=self.active_lap_number or 0,
-            time_ms=time_ms,
-            invalid=self.active_invalid,
-            samples=self.active_samples,
-            setup=dict(self.current_setup) if self.current_setup else None,
-            saved_at=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
-            sector1_ms=_positive(state.get("sector1_ms")),
-            sector2_ms=_positive(state.get("sector2_ms")),
+            number=self.active_lap_number or 0, time_ms=time_ms, invalid=self.active_invalid,
+            samples=self.active_samples, setup=self.active_lap_setup, saved_at=saved_at,
+            sector1_ms=_positive(state.get("sector1_ms")), sector2_ms=_positive(state.get("sector2_ms")),
+            recording_session_id=session.id, game_session_uid=session.game_session_uid,
+            mode=session.mode, track_id=session.track_id, track_length_m=session.track_length_m,
         ))
-        self.laps.append(lap)
+        self.session_laps[session.id].append(lap)
+        session.lap_ids.append(lap.id)
+        self._refresh_lap_index()
         payload = asdict(lap)
         payload["sample_count"] = len(lap.samples)
-        (self.capture_dir / f"{lap.id}.json").write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        directory = self.sessions_dir / session.id
+        (directory / f"{lap.id}.json").write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        self._persist_session(session)
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        with self.lock:
+            real = [session for session in self.sessions.values() if session.id != LEGACY_SESSION_ID]
+            real.sort(key=lambda item: item.started_at, reverse=True)
+            ordered = real + [self.sessions[LEGACY_SESSION_ID]]
+            return [session.summary(self.session_laps[session.id]) for session in ordered]
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            summaries = [lap.summary(self.notes.get(lap.id, "")) for lap in self.laps[-50:]]
             latest = dict(self.latest)
             latest["connected"] = self.last_packet_at is not None and monotonic() - self.last_packet_at < 3.0
-            return {"latest": latest, "laps": summaries}
+            active = self.sessions.get(self.active_recording_id or "")
+            selected = self.sessions.get(self.selected_session_id or "")
+            return {
+                "latest": latest,
+                "laps": [lap.summary(self.notes.get(lap.id, "")) for lap in self.session_laps.get(self.selected_session_id or "", [])],
+                "recording": active.summary(self.session_laps[active.id]) if active else None,
+                "selected_session_id": self.selected_session_id,
+                "selected_is_active": bool(active and selected and active.id == selected.id),
+            }
 
-    def list_laps(self) -> list[dict[str, Any]]:
+    def list_laps(self, session_id: str | None = None) -> list[dict[str, Any]]:
         with self.lock:
-            return [lap.summary(self.notes.get(lap.id, "")) for lap in self.laps]
+            selected = session_id or self.selected_session_id or LEGACY_SESSION_ID
+            if selected not in self.sessions:
+                raise SessionStateError("Unknown session ID")
+            return [lap.summary(self.notes.get(lap.id, "")) for lap in self.session_laps[selected]]
 
     def get_lap_object(self, lap_id: str) -> Lap | None:
         return next((lap for lap in self.laps if lap.id == lap_id), None)
@@ -237,20 +552,26 @@ class UdpReceiver(Thread):
 
     def _handle(self, data: bytes) -> None:
         header = decode_header(data)
-        if header is None:
+        if header is None or header.packet_format != 2025 or header.game_year != 25:
             return
-        if header.packet_id == PACKET_LAP_DATA:
+        if header.packet_id == PACKET_SESSION:
+            session = decode_session(data, header)
+            if session:
+                self.store.record_game_session(session)
+        elif header.packet_id == PACKET_LAP_DATA:
             lap_state = decode_player_lap_data(data, header)
             if lap_state:
-                self.store.record_lap_state(lap_state)
+                self.store.record_lap_state(lap_state, header.session_uid)
         elif header.packet_id == PACKET_CAR_TELEMETRY:
             telemetry = decode_player_car_telemetry(data, header)
             if telemetry:
-                self.store.record_telemetry(telemetry, header.session_time)
+                self.store.record_telemetry(telemetry, header.session_time, header.session_uid)
         elif header.packet_id == PACKET_CAR_SETUPS:
             setup = decode_player_setup(data, header)
             if setup:
-                self.store.record_setup(setup)
+                self.store.record_setup(setup, header.session_uid)
+        elif header.packet_id == PACKET_EVENT and decode_event_code(data, header) == "SEND":
+            self.store.game_session_ended(header.session_uid)
 
     def stop(self) -> None:
         self.stop_event.set()

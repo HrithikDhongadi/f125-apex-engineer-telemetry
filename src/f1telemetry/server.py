@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .analysis import ComparisonError, compare_laps
-from .receiver import SessionStore, UdpReceiver
+from .receiver import SessionStateError, SessionStore, UdpReceiver
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "static"
@@ -27,7 +27,19 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if path == "/api/snapshot":
             return self._json(self.store.snapshot())
         if path == "/api/laps":
-            return self._json({"laps": self.store.list_laps()})
+            session_id = parse_qs(request.query).get("session", [None])[0]
+            try:
+                return self._json({"laps": self.store.list_laps(session_id)})
+            except SessionStateError as error:
+                return self._json({"error": str(error)}, 404)
+        if path == "/api/sessions":
+            return self._json({"sessions": self.store.list_sessions(), **self.store.snapshot()})
+        if path.startswith("/api/sessions/") and path.endswith("/laps"):
+            session_id = unquote(path[len("/api/sessions/"):-len("/laps")].rstrip("/"))
+            try:
+                return self._json({"session_id": session_id, "laps": self.store.list_laps(session_id)})
+            except SessionStateError as error:
+                return self._json({"error": str(error)}, 404)
         if path == "/api/compare":
             query = parse_qs(request.query)
             baseline_id = query.get("baseline", [""])[0]
@@ -50,18 +62,40 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
+        try:
+            payload = self._request_json()
+        except ValueError:
+            return self._json({"error": "Request body must be a JSON object"}, 400)
+        try:
+            if path == "/api/runs/start":
+                return self._json(self.store.start_time_trial_run(str(payload.get("name", ""))), 201)
+            if path == "/api/recording/stop":
+                return self._json(self.store.stop_recording())
+            if path == "/api/sessions/select":
+                return self._json(self.store.select_session(str(payload.get("session_id", ""))))
+            if path.startswith("/api/sessions/") and path.endswith("/rename"):
+                session_id = unquote(path[len("/api/sessions/"):-len("/rename")].rstrip("/"))
+                return self._json(self.store.rename_session(session_id, str(payload.get("name", ""))))
+        except SessionStateError as error:
+            status = 404 if "Unknown" in str(error) else 409
+            return self._json({"error": str(error)}, status)
         if path.startswith("/api/laps/") and path.endswith("/note"):
             lap_id = unquote(path[len("/api/laps/"):-len("/note")].rstrip("/"))
-            try:
-                length = min(int(self.headers.get("Content-Length", "0")), 4096)
-                payload = json.loads(self.rfile.read(length) or b"{}")
-                if not isinstance(payload.get("note", ""), str):
-                    raise ValueError
-            except (ValueError, json.JSONDecodeError):
+            if not isinstance(payload.get("note", ""), str):
                 return self._json({"error": "Request body must contain a text note"}, 400)
             result = self.store.set_note(lap_id, payload.get("note", ""))
             return self._json(result or {"error": "Lap not found"}, 200 if result else 404)
         return self._json({"error": "Endpoint not found"}, 404)
+
+    def _request_json(self) -> dict:
+        try:
+            length = max(0, min(int(self.headers.get("Content-Length", "0")), 4096))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError) as error:
+            raise ValueError from error
+        if not isinstance(payload, dict):
+            raise ValueError
+        return payload
 
     def _json(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")
@@ -73,18 +107,19 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve(port: int = 8025, udp_port: int = 20777) -> None:
+def serve(port: int = 8025, udp_port: int = 20777, host: str = "127.0.0.1") -> None:
     store = SessionStore(DATA)
     receiver = UdpReceiver(store, udp_port)
-    receiver.start()
     DashboardHandler.store = store
-    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
-    print(f"Apex Engineer: http://127.0.0.1:{port}")
+    server = ThreadingHTTPServer((host, port), DashboardHandler)
+    receiver.start()
+    print(f"Apex Engineer: http://{host}:{port}")
     print(f"Listening for F1 25 UDP telemetry on 0.0.0.0:{udp_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping Apex Engineer.")
     finally:
+        store.interrupt_active()
         receiver.stop()
         server.server_close()

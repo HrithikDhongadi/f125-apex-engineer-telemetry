@@ -59,10 +59,26 @@ def aligned_trace(lap: Lap, points: int = 501) -> tuple[list[dict[str, Any]], st
     rows.sort(key=lambda row: row["_x"])
     xs = [row["_x"] for row in rows]
     axis = [index / (points - 1) for index in range(points)]
-    return [{
+    trace = [{
         "distance_pct": round(x * 100, 2),
         **{field: _interpolate(rows, xs, x, field, lap.time_ms) for field in TRACE_FIELDS},
-    } for x in axis], quality
+    } for x in axis]
+    # UDP sampling normally stops just before the timing line. Distribute the
+    # small endpoint correction across the lap instead of creating a final spike.
+    raw_start = trace[0]["current_lap_ms"] or 0
+    raw_end = trace[-1]["current_lap_ms"] or lap.time_ms
+    correction = lap.time_ms - (raw_end - raw_start)
+    for index, row in enumerate(trace):
+        progress = index / (points - 1)
+        row["current_lap_ms"] = (row["current_lap_ms"] or 0) - raw_start + progress * correction
+    return trace, quality
+
+
+def _endpoint_adjustment(lap: Lap) -> float:
+    timed = [row.get("current_lap_ms") for row in lap.samples if isinstance(row.get("current_lap_ms"), (int, float))]
+    if len(timed) < 2:
+        return 0.0
+    return float(lap.time_ms) - (float(timed[-1]) - float(timed[0]))
 
 
 def _crossing(trace: list[dict[str, Any]], field: str, threshold: float, start: int, end: int) -> float | None:
@@ -126,8 +142,28 @@ def _window_notes(baseline: list[dict[str, Any]], candidate: list[dict[str, Any]
 def compare_laps(baseline: Lap, candidate: Lap) -> dict[str, Any]:
     if baseline.invalid or candidate.invalid:
         raise ComparisonError("Only valid laps can be compared")
+    both_legacy = baseline.recording_session_id == candidate.recording_session_id == "legacy"
+    if not both_legacy:
+        if baseline.mode != candidate.mode:
+            if {baseline.mode, candidate.mode} == {"race", "time_trial"}:
+                raise ComparisonError("Race and Time Trial laps cannot be compared")
+            raise ComparisonError("Legacy or unknown-mode laps cannot be compared with recorded sessions")
+        if baseline.track_id is None or candidate.track_id is None or baseline.track_id < 0 or candidate.track_id < 0:
+            raise ComparisonError("Both laps need a known track before they can be compared")
+        if baseline.track_id != candidate.track_id:
+            raise ComparisonError("Laps from different tracks cannot be compared")
+        if baseline.mode == "race" and baseline.recording_session_id != candidate.recording_session_id:
+            raise ComparisonError("Race laps can only be compared within the same recording session")
+        if baseline.mode not in {"race", "time_trial"} and baseline.recording_session_id != candidate.recording_session_id:
+            raise ComparisonError("These laps do not have compatible recording modes")
     base_trace, base_quality = aligned_trace(baseline)
     candidate_trace, candidate_quality = aligned_trace(candidate)
+    if (
+        baseline.mode == candidate.mode == "time_trial"
+        and baseline.recording_session_id != candidate.recording_session_id
+        and base_quality != candidate_quality
+    ):
+        raise ComparisonError("Time Trial runs use incompatible alignment data")
     trace, deltas = [], []
     for base, cand in zip(base_trace, candidate_trace):
         delta = (cand["current_lap_ms"] - base["current_lap_ms"]) / 1000
@@ -139,13 +175,25 @@ def compare_laps(baseline: Lap, candidate: Lap) -> dict[str, Any]:
             "delta_s": round(delta, 4),
         })
     final_delta = (candidate.time_ms - baseline.time_ms) / 1000
-    trace[-1]["delta_s"], deltas[-1] = round(final_delta, 4), final_delta
-    track_length = max((float(s.get("lap_distance_m", 0) or 0) for s in baseline.samples), default=5891.0)
-    if track_length < 100:
-        track_length = 5891.0
+    has_real_distance = base_quality == candidate_quality == "distance"
+    is_silverstone = baseline.track_id == candidate.track_id == 7
+    if not has_real_distance:
+        calibration = "Legacy approximation: lap distance was not recorded. Corner windows and metre-based engineer notes are disabled."
+        windows = []
+    elif not is_silverstone:
+        calibration = "Silverstone engineer notes are unavailable because this track is not positively identified as normal Silverstone (track ID 7)."
+        windows = []
+    else:
+        calibration = "Approximate normalized Silverstone windows; precise track-distance calibration is not yet implemented."
+        windows = _window_notes(base_trace, candidate_trace, float(baseline.track_length_m or 5891))
     return {
         "baseline": baseline.summary(), "candidate": candidate.summary(),
         "alignment": {"baseline": base_quality, "candidate": candidate_quality, "points": len(trace)},
+        "endpoint_estimation": {
+            "method": "The gap from the last UDP sample to each official lap time is distributed linearly over the trace.",
+            "baseline_adjustment_ms": round(_endpoint_adjustment(baseline), 1),
+            "candidate_adjustment_ms": round(_endpoint_adjustment(candidate), 1),
+        },
         "delta_definition": "candidate time minus baseline time; negative means candidate is faster",
         "summary": {
             "final_delta_s": round(final_delta, 3), "maximum_gain_s": round(min(deltas), 3),
@@ -156,7 +204,7 @@ def compare_laps(baseline: Lap, candidate: Lap) -> dict[str, Any]:
         "markers": {"baseline": _markers(base_trace), "candidate": _markers(candidate_trace)},
         "trace": trace,
         "engineer_notes": {
-            "calibration": "Approximate normalized Silverstone windows; precise track-distance calibration is not yet implemented.",
-            "windows": _window_notes(base_trace, candidate_trace, track_length),
+            "calibration": calibration,
+            "windows": windows,
         },
     }

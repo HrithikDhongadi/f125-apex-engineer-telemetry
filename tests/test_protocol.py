@@ -6,6 +6,7 @@ from src.f1telemetry.protocol import (
     decode_header,
     decode_player_car_telemetry,
     decode_player_setup,
+    decode_session,
 )
 
 
@@ -35,6 +36,24 @@ class ProtocolTests(unittest.TestCase):
         packet = header + first_car + player_car + bytes(50 * 20)
         setup = decode_player_setup(packet, decode_header(packet))
         self.assertEqual(setup, {"front_wing": 19, "rear_wing": 15, "on_throttle_diff": 100, "off_throttle_diff": 30})
+
+    def test_session_packet_decodes_mode_track_and_length(self):
+        header = struct.pack("<HBBBBBQfIIBB", 2025, 25, 1, 0, 1, 1, 9876, 10.5, 17, 17, 0, 255)
+        body = bytearray(8)
+        struct.pack_into("<H", body, 4, 5891)
+        body[6] = 18
+        struct.pack_into("<b", body, 7, 7)
+        decoded = decode_session(header + body, decode_header(header + body))
+        self.assertEqual(decoded, {
+            "session_uid": 9876, "session_type": 18, "mode": "time_trial",
+            "track_id": 7, "track_length_m": 5891,
+        })
+
+    def test_session_packet_rejects_wrong_format_or_version(self):
+        wrong_format = struct.pack("<HBBBBBQfIIBB", 2024, 24, 1, 0, 1, 1, 1, 0, 0, 0, 0, 255) + bytes(8)
+        wrong_version = struct.pack("<HBBBBBQfIIBB", 2025, 25, 1, 0, 2, 1, 1, 0, 0, 0, 0, 255) + bytes(8)
+        self.assertIsNone(decode_session(wrong_format, decode_header(wrong_format)))
+        self.assertIsNone(decode_session(wrong_version, decode_header(wrong_version)))
 
 
 if __name__ == "__main__":

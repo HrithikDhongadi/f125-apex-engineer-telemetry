@@ -10,7 +10,9 @@ HEADER = struct.Struct("<HBBBBBQfIIBB")
 HEADER_SIZE = HEADER.size
 MAX_CARS = 22
 
+PACKET_SESSION = 1
 PACKET_LAP_DATA = 2
+PACKET_EVENT = 3
 PACKET_CAR_SETUPS = 5
 PACKET_CAR_TELEMETRY = 6
 
@@ -18,6 +20,7 @@ PACKET_CAR_TELEMETRY = 6
 CAR_TELEMETRY_SIZE = 60
 LAP_DATA_SIZE = 57
 CAR_SETUP_SIZE = 50
+SESSION_PACKET_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -132,3 +135,37 @@ def decode_player_setup(data: bytes, header: PacketHeader) -> dict[str, int] | N
         "on_throttle_diff": data[offset + 2],
         "off_throttle_diff": data[offset + 3],
     }
+
+
+def decode_session(data: bytes, header: PacketHeader) -> dict[str, int | str] | None:
+    """Decode the stable leading fields of the F1 25 Session packet."""
+    if (
+        header.packet_format != 2025
+        or header.game_year != 25
+        or header.packet_id != PACKET_SESSION
+        or header.packet_version != SESSION_PACKET_VERSION
+        or len(data) < HEADER_SIZE + 8
+    ):
+        return None
+    track_length_m = struct.unpack_from("<H", data, HEADER_SIZE + 4)[0]
+    session_type = data[HEADER_SIZE + 6]
+    track_id = struct.unpack_from("<b", data, HEADER_SIZE + 7)[0]
+    mode = "time_trial" if session_type == 18 else "race" if 15 <= session_type <= 17 else "unknown"
+    return {
+        "session_uid": header.session_uid,
+        "session_type": session_type,
+        "mode": mode,
+        "track_id": track_id,
+        "track_length_m": track_length_m,
+    }
+
+
+def decode_event_code(data: bytes, header: PacketHeader) -> str | None:
+    if (
+        header.packet_format != 2025
+        or header.game_year != 25
+        or header.packet_id != PACKET_EVENT
+        or len(data) < HEADER_SIZE + 4
+    ):
+        return None
+    return data[HEADER_SIZE:HEADER_SIZE + 4].decode("ascii", errors="ignore")

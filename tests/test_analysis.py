@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from src.f1telemetry.analysis import aligned_trace, compare_laps
+from src.f1telemetry.analysis import ComparisonError, aligned_trace, compare_laps
 from src.f1telemetry.receiver import Lap, SessionStore
 
 
@@ -68,8 +68,38 @@ class SessionStoreTests(unittest.TestCase):
             store = SessionStore(Path(directory))
             store.record_lap_state({"lap_number": 1, "last_lap_ms": 0, "current_lap_ms": 12_345, "lap_distance_m": 800.5, "invalid": False})
             store.record_telemetry({"speed_kph": 250}, 20.0)
-            self.assertEqual(store.active_samples[0]["lap_distance_m"], 800.5)
-            self.assertEqual(store.active_samples[0]["current_lap_ms"], 12_345)
+            latest = store.snapshot()["latest"]
+            self.assertEqual(latest["lap_distance_m"], 800.5)
+            self.assertEqual(latest["current_lap_ms"], 12_345)
+
+    def test_incompatible_modes_and_tracks_are_rejected(self):
+        samples = [sample(0, 0), sample(5891, 90_000)]
+        race = Lap(1, 90_000, False, samples=samples, saved_at="race", recording_session_id="race-1", mode="race", track_id=7)
+        trial = Lap(1, 89_000, False, samples=samples, saved_at="tt", recording_session_id="tt-1", mode="time_trial", track_id=7)
+        with self.assertRaisesRegex(ComparisonError, "Race and Time Trial"):
+            compare_laps(race, trial)
+        other_track = Lap(1, 89_000, False, samples=samples, saved_at="other", recording_session_id="tt-2", mode="time_trial", track_id=8)
+        with self.assertRaisesRegex(ComparisonError, "different tracks"):
+            compare_laps(trial, other_track)
+
+    def test_legacy_alignment_suppresses_corner_notes(self):
+        old_samples = [{**sample(None, 0), "lap_distance_m": None}, {**sample(None, 90_000), "lap_distance_m": None}]
+        first = Lap(1, 90_000, False, samples=old_samples, saved_at="old-a")
+        second = Lap(2, 89_500, False, samples=old_samples, saved_at="old-b")
+        comparison = compare_laps(first, second)
+        self.assertEqual(comparison["alignment"]["baseline"], "legacy-time")
+        self.assertEqual(comparison["engineer_notes"]["windows"], [])
+        self.assertIn("Legacy approximation", comparison["engineer_notes"]["calibration"])
+
+    def test_final_delta_is_smoothed_to_official_time(self):
+        base_samples = [sample(0, 500), sample(3000, 45_000), sample(5891, 88_000)]
+        candidate_samples = [sample(0, 500), sample(3000, 45_000), sample(5891, 88_000)]
+        baseline = Lap(1, 90_000, False, samples=base_samples, saved_at="smooth-a", recording_session_id="tt-a", mode="time_trial", track_id=7)
+        candidate = Lap(1, 89_000, False, samples=candidate_samples, saved_at="smooth-b", recording_session_id="tt-b", mode="time_trial", track_id=7)
+        trace = compare_laps(baseline, candidate)["trace"]
+        self.assertAlmostEqual(trace[0]["delta_s"], 0.0, places=4)
+        self.assertAlmostEqual(trace[-1]["delta_s"], -1.0, places=4)
+        self.assertLess(abs(trace[-1]["delta_s"] - trace[-2]["delta_s"]), 0.01)
 
 
 if __name__ == "__main__":

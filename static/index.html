@@ -17,6 +17,24 @@
         <button data-view="analysis">Lap Analysis</button>
         <button data-view="session">Session</button>
       </nav>
+      <section class="panel recorder" aria-label="Recording session controls">
+        <div class="recorder-status">
+          <span id="recording-badge" class="recording-badge">Not recording</span>
+          <div><h2 id="recording-name">Waiting for game session</h2><p id="game-context" class="hint">Session mode and track will appear from UDP.</p></div>
+        </div>
+        <div class="recorder-actions">
+          <input id="run-name" maxlength="80" placeholder="Run name, e.g. rear wing +1">
+          <button id="start-run" class="primary" hidden>Start new run</button>
+          <button id="stop-recording" class="danger" hidden>Stop recording</button>
+          <button id="jump-active" hidden>Jump to active session</button>
+        </div>
+        <p id="recording-message" class="error" role="alert"></p>
+        <div class="displayed-session">
+          <label for="session-select">Displayed session</label>
+          <select id="session-select"></select>
+          <span id="historical-badge" class="historical" hidden>Historical view · live telemetry remains current</span>
+        </div>
+      </section>
 
       <section id="view-live" class="view active">
         <div class="metrics">
@@ -51,6 +69,11 @@
       </section>
 
       <section id="view-session" class="view">
+        <article class="panel session-library">
+          <div class="panel-heading"><div><h2>Session library</h2><p class="hint">Select a session to inspect it. Legacy captures are read-only.</p></div></div>
+          <div id="session-cards" class="session-cards"></div>
+          <div class="rename-row"><input id="rename-session" maxlength="80" placeholder="Rename selected session"><button id="rename-button">Rename</button></div>
+        </article>
         <article class="panel table-panel">
           <div class="panel-heading"><div><h2>Recorded laps</h2><p class="hint">Sorted fastest first; notes are stored locally.</p></div><span id="lap-count"></span></div>
           <div class="table-scroll"><table><thead><tr><th>Lap</th><th>Time</th><th>Sectors 1 / 2</th><th>Setup</th><th>Samples</th><th>Peak / min</th><th>Note or tag</th></tr></thead><tbody id="session-laps"></tbody></table></div>

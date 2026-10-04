@@ -3,29 +3,61 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Apex Engineer</title>
+    <title>Apex Engineer · Lap Analysis</title>
     <link rel="stylesheet" href="style.css">
   </head>
   <body>
     <main>
       <header>
-        <div><p class="eyebrow">F1 25 · LOCAL TELEMETRY</p><h1>Apex Engineer</h1></div>
+        <div><p class="eyebrow">F1 25 · SILVERSTONE DEVELOPMENT</p><h1>Apex Engineer</h1></div>
         <div id="connection" class="status">Waiting for UDP</div>
       </header>
-      <section class="live" aria-label="Live telemetry">
-        <article><span>Speed</span><strong id="speed">—</strong><small>km/h</small></article>
-        <article><span>Gear</span><strong id="gear">—</strong><small>current</small></article>
-        <article><span>Throttle</span><strong id="throttle">—</strong><small>%</small></article>
-        <article><span>Brake</span><strong id="brake">—</strong><small>%</small></article>
-        <article><span>Lap distance</span><strong id="distance">—</strong><small>m</small></article>
+      <nav class="tabs" aria-label="Dashboard views">
+        <button class="active" data-view="live">Live</button>
+        <button data-view="analysis">Lap Analysis</button>
+        <button data-view="session">Session</button>
+      </nav>
+
+      <section id="view-live" class="view active">
+        <div class="metrics">
+          <article><span>Speed</span><strong id="speed">—</strong><small>km/h</small></article>
+          <article><span>Gear</span><strong id="gear">—</strong><small>current</small></article>
+          <article><span>Throttle</span><strong id="throttle">—</strong><small>%</small></article>
+          <article><span>Brake</span><strong id="brake">—</strong><small>%</small></article>
+        </div>
+        <div class="grid">
+          <article class="panel"><h2>Active setup</h2><div id="setup" class="setup empty">Waiting for car-setup packet…</div></article>
+          <article class="panel"><h2>Current lap</h2><div id="lap-state" class="setup empty">Waiting for lap packet…</div></article>
+        </div>
+        <article class="panel"><div class="panel-heading"><h2>Tyres & brakes</h2><span class="hint">Hottest current reading is outlined, not a setup recommendation.</span></div><div id="wheels" class="wheel-grid"></div></article>
       </section>
-      <section class="grid">
-        <article class="panel"><h2>Active setup</h2><div id="setup" class="setup">Waiting for car-setup packet…</div></article>
-        <article class="panel"><h2>Live tyres & brakes</h2><div id="temps" class="temps">Waiting for telemetry…</div></article>
+
+      <section id="view-analysis" class="view">
+        <article class="panel compare-controls">
+          <div><label for="baseline">Baseline lap</label><select id="baseline"></select></div>
+          <div><label for="candidate">Candidate lap</label><select id="candidate"></select></div>
+          <button id="compare">Compare valid laps</button>
+          <p id="compare-error" class="error" role="alert"></p>
+        </article>
+        <div id="comparison" hidden>
+          <div id="comparison-summary" class="summary-grid"></div>
+          <p id="alignment-notice" class="notice"></p>
+          <article class="panel chart-panel"><h2>Lap delta</h2><p class="hint">Candidate − baseline. Negative is faster.</p><div class="chart" data-chart="delta"></div></article>
+          <article class="panel chart-panel"><h2>Speed</h2><div class="chart" data-chart="speed"></div></article>
+          <article class="panel chart-panel"><h2>Throttle & brake</h2><div class="chart" data-chart="pedals"></div></article>
+          <article class="panel"><div class="panel-heading"><h2>Engineer Notes</h2><span class="hint">Trace evidence only</span></div><p id="calibration" class="notice"></p><div id="engineer-notes" class="notes-grid"></div></article>
+        </div>
+        <article id="analysis-empty" class="panel empty-state">Select two valid laps. The candidate delta is measured against the baseline.</article>
       </section>
-      <section class="panel laps"><h2>Recorded laps</h2><p>Select two valid laps to compare their speed traces.</p><div id="lap-list"></div></section>
-      <section class="panel chart-panel"><h2 id="chart-title">Lap comparison</h2><svg id="chart" viewBox="0 0 1000 300" role="img" aria-label="Normalized speed traces"></svg><p class="legend"><span class="a"></span>First selection <span class="b"></span>Second selection</p></section>
+
+      <section id="view-session" class="view">
+        <article class="panel table-panel">
+          <div class="panel-heading"><div><h2>Recorded laps</h2><p class="hint">Sorted fastest first; notes are stored locally.</p></div><span id="lap-count"></span></div>
+          <div class="table-scroll"><table><thead><tr><th>Lap</th><th>Time</th><th>Sectors 1 / 2</th><th>Setup</th><th>Samples</th><th>Peak / min</th><th>Note or tag</th></tr></thead><tbody id="session-laps"></tbody></table></div>
+        </article>
+      </section>
     </main>
+    <div id="tooltip" class="tooltip" hidden></div>
     <script src="app.js"></script>
   </body>
 </html>

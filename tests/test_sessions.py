@@ -322,6 +322,41 @@ class RecordingSessionTests(unittest.TestCase):
             self.assertIsNone(store.active_recording_id)
             self.assertEqual(store.sessions[active].status, "stopped")
 
+    def test_live_race_grid_packet_captures_lap_one_from_nonzero_start_position(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="race", track_length=5_890))
+            run_id = store.active_recording_id
+            self.assertEqual(store.sessions[run_id].status, "armed")
+
+            # Exact opening state from the live race: P14 started 25.83 m
+            # beyond the lap-distance origin, but session time proves this is
+            # the race start rather than a recording begun mid-lap.
+            store.record_lap_state(lap_state(
+                1, 0, 25.83, 0, total_distance=25.83,
+            ), UID, {"session_time": 0.0, "frame_identifier": 0})
+            self.assertEqual(store.sessions[run_id].status, "recording")
+            self.assertTrue(store.capture_current_lap)
+            self.assertEqual(store.active_lap_number, 1)
+
+            for index in range(40):
+                progress = index / 39
+                current = int(progress * 100_047)
+                distance = 25.83 + progress * (5_888.78 - 25.83)
+                store.record_lap_state(lap_state(
+                    1, current, distance, total_distance=distance,
+                ), UID)
+                store.record_telemetry(telemetry(160 + index), progress * 100.047, UID)
+            store.record_lap_state(lap_state(
+                2, 16, 1.49, 100_077, total_distance=5_892.16,
+            ), UID)
+
+            laps = store.session_laps[run_id]
+            self.assertEqual([lap.number for lap in laps], [1])
+            self.assertEqual(laps[0].time_ms, 100_077)
+            self.assertAlmostEqual(laps[0].samples[0]["lap_distance_m"], 25.83)
+            self.assertGreater(laps[0].samples[-1]["lap_distance_m"], 5_880)
+
     def test_new_uid_closes_and_resets_without_mixing_samples(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))

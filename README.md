@@ -53,7 +53,7 @@ The initial segment captures the first few laps; up to seven additional rewind/R
 
 ### Race
 
-Race types start a recording automatically. A recording closes when the game session ends or its session UID changes. **Stop recording** can close it manually; the same game UID will not automatically reopen afterward. A new game session can start another recording.
+Race types start a recording automatically. The first lap is captured directly from the starting grid when the initial packet identifies lap 1 at the beginning of game session time; grid position may place the car beyond 0 m and does not cause lap 1 to be omitted. A recording closes when the game session ends or its session UID changes. **Stop recording** can close it manually; the same game UID will not automatically reopen afterward. A new game session can start another recording.
 
 Changing setup during a lap does not relabel that lap: each completed lap retains the setup seen at its start.
 

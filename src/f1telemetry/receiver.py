@@ -549,11 +549,29 @@ class SessionStore:
             flags: dict[str, Any] = {}
             lap_number = int(lap_state["lap_number"])
             if self.active_lap_number is None:
-                # With no earlier Lap Data there is no proof that this is the
-                # beginning of a full lap. Stay armed until a verified crossing.
-                self._begin_lap(lap_number, False)
-                decision = "initial_observation"
-                reasons.append("no_previous_lap_packet_so_full_lap_start_is_unproven")
+                packet_session_time = (packet_meta or {}).get("session_time")
+                race_grid_start = bool(
+                    active_session is not None
+                    and active_session.mode == "race"
+                    and active_session.status == "armed"
+                    and lap_number == 1
+                    and int(lap_state.get("last_lap_ms", 0)) == 0
+                    and int(lap_state.get("current_lap_ms", 0)) <= 1_500
+                    and isinstance(packet_session_time, (int, float))
+                    and 0 <= float(packet_session_time) <= 5
+                )
+                self._begin_lap(lap_number, race_grid_start)
+                flags = {"race_grid_start": race_grid_start}
+                if race_grid_start:
+                    active_session.status = "recording"
+                    self._persist_session(active_session)
+                    decision = "start_capture"
+                    reasons.append("verified_race_grid_start")
+                else:
+                    # With no earlier Lap Data there is no proof that this is
+                    # the beginning of a full lap. Stay armed until a crossing.
+                    decision = "initial_observation"
+                    reasons.append("no_previous_lap_packet_so_full_lap_start_is_unproven")
             else:
                 old_number = self.active_lap_number
                 old_time = self.active_lap_state.get("current_lap_ms")

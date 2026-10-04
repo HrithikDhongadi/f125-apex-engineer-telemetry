@@ -58,6 +58,7 @@ class RecordingSessionTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
             store.record_game_session(game())
+            store.record_lap_state(lap_state(1), UID)
             run = store.start_time_trial_run("test")
             fill_lap(store, UID, 1)
             for index in range(10):
@@ -71,6 +72,7 @@ class RecordingSessionTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
             store.record_game_session(game())
+            store.record_lap_state(lap_state(1), UID)
             first = store.start_time_trial_run("first")
             fill_lap(store, UID, 1)
             store.stop_recording()
@@ -134,8 +136,8 @@ class RecordingSessionTests(unittest.TestCase):
             first_setup = {"front_wing": 18, "rear_wing": 18, "on_throttle_diff": 25, "off_throttle_diff": 50}
             second_setup = {"front_wing": 20, "rear_wing": 19, "on_throttle_diff": 30, "off_throttle_diff": 55}
             store.record_setup(first_setup, UID)
-            run = store.start_time_trial_run("setup test")
             store.record_lap_state(lap_state(1), UID)
+            run = store.start_time_trial_run("setup test")
             for index in range(15):
                 store.record_telemetry(telemetry(), index, UID)
             store.record_setup(second_setup, UID)
@@ -143,6 +145,78 @@ class RecordingSessionTests(unittest.TestCase):
                 store.record_telemetry(telemetry(), index, UID)
             store.record_lap_state(lap_state(2, 0, 0, 90_000), UID)
             self.assertEqual(store.session_laps[run["id"]][0].setup, first_setup)
+
+    def test_restart_lap_with_zero_last_time_captures_next_full_lap(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(8), UID)
+            run = store.start_time_trial_run("restart regression")
+            fill_lap(store, UID, 8)
+            store.record_lap_state(lap_state(9, 35_000, 2300), UID)
+            for index in range(8):
+                store.record_telemetry(telemetry(90), 100 + index, UID)
+
+            # Restart Lap rewinds behind the line. The abandoned samples must
+            # be discarded, and the next crossing has no completed-lap time.
+            store.record_lap_state(lap_state(8, 0, -60, 0), UID)
+            store.record_lap_state(lap_state(9, 100, 5, 0), UID)
+            fill_lap(store, UID, 9)
+
+            recorded = store.session_laps[run["id"]]
+            self.assertEqual([lap.number for lap in recorded], [8, 9])
+            restarted = recorded[-1]
+            distances = [sample["lap_distance_m"] for sample in restarted.samples]
+            self.assertLessEqual(min(distances), 5)
+            self.assertGreater(max(distances), 5_800)
+            self.assertNotIn(90, [sample["speed_kph"] for sample in restarted.samples])
+
+    def test_midlap_flashback_discards_lap_until_next_crossing(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(3), UID)
+            run = store.start_time_trial_run("flashback")
+            for index in range(30):
+                store.record_lap_state(lap_state(3, 20_000 + index * 500, 1500 + index * 20), UID)
+                store.record_telemetry(telemetry(), index, UID)
+            store.record_lap_state(lap_state(3, 15_000, 1100), UID)
+            store.record_lap_state(lap_state(4, 0, 0, 90_000), UID)
+            fill_lap(store, UID, 4)
+            self.assertEqual([lap.number for lap in store.session_laps[run["id"]]], [4])
+
+    def test_start_before_first_lap_packet_cannot_save_partial_lap(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            run = store.start_time_trial_run("early start")
+            self.assertEqual(run["status"], "armed")
+            store.record_lap_state(lap_state(5, 42_000, 2800), UID)
+            for index in range(30):
+                store.record_telemetry(telemetry(), index, UID)
+            store.record_lap_state(lap_state(6, 0, 0, 90_000), UID)
+            fill_lap(store, UID, 6)
+            self.assertEqual([lap.number for lap in store.session_laps[run["id"]]], [6])
+
+    def test_packet_gap_midlap_is_not_treated_as_start_line(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            run = store.start_time_trial_run("packet gap")
+            store.record_lap_state(lap_state(2, 25_000, 1700), UID)
+            store.record_lap_state(lap_state(3, 30_000, 2100, 0), UID)
+            self.assertEqual(store.sessions[run["id"]].status, "armed")
+            self.assertFalse(store.capture_current_lap)
+
+    def test_negative_distance_crossing_starts_capture_without_lap_number_change(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            run = store.start_time_trial_run("negative start")
+            store.record_lap_state(lap_state(8, 0, -40, 0), UID)
+            store.record_lap_state(lap_state(8, 100, 5, 0), UID)
+            self.assertEqual(store.sessions[run["id"]].status, "recording")
+            self.assertTrue(store.capture_current_lap)
 
     def test_auto_recording_does_not_replace_historical_selection(self):
         with TemporaryDirectory() as directory:

@@ -17,6 +17,8 @@ from .protocol import (
     PACKET_SESSION, decode_event_code, decode_header, decode_player_car_telemetry,
     decode_player_lap_data, decode_player_setup, decode_session,
 )
+from .personal_bests import PersonalBestRegistry
+from .quality import lap_quality
 
 LEGACY_SESSION_ID = "legacy"
 TRACK_NAMES = {7: "Silverstone"}
@@ -74,6 +76,7 @@ class Lap:
             "recording_session_id": self.recording_session_id,
             "game_session_uid": self.game_session_uid, "mode": self.mode,
             "track_id": self.track_id, "track_length_m": self.track_length_m,
+            "quality": lap_quality(self),
         }
 
 
@@ -142,6 +145,7 @@ class SessionStore:
         self.sessions_dir = self.capture_dir / "sessions"
         self.sessions_dir.mkdir(exist_ok=True)
         self.notes_path = self.capture_dir / "notes.json"
+        self.pb_registry = PersonalBestRegistry(self.capture_dir / "personal_bests")
         self.lock = Lock()
         self.latest: dict[str, Any] = {"connected": False}
         self.last_packet_at: float | None = None
@@ -286,7 +290,7 @@ class SessionStore:
 
     def _at_lap_start(self) -> bool:
         if self.active_lap_number is None:
-            return True
+            return False
         return (
             float(self.active_lap_state.get("current_lap_ms", 999_999)) <= 1_500
             and float(self.active_lap_state.get("lap_distance_m", 999_999)) <= 100
@@ -409,17 +413,39 @@ class SessionStore:
             self._observe_uid(session_uid)
             lap_number = int(lap_state["lap_number"])
             if self.active_lap_number is None:
-                recording = self.active_recording_id is not None and self.sessions[self.active_recording_id].status == "recording"
-                self._begin_lap(lap_number, recording)
-            elif lap_number != self.active_lap_number:
-                normal_crossing = (
-                    lap_number > self.active_lap_number
-                    and int(lap_state.get("last_lap_ms", 0)) >= 30_000
-                    and int(lap_state.get("current_lap_ms", 0)) <= 5_000
+                # With no earlier Lap Data there is no proof that this is the
+                # beginning of a full lap. Stay armed until a verified crossing.
+                self._begin_lap(lap_number, False)
+            else:
+                old_number = self.active_lap_number
+                old_time = self.active_lap_state.get("current_lap_ms")
+                old_distance = self.active_lap_state.get("lap_distance_m")
+                new_time = int(lap_state.get("current_lap_ms", 0))
+                new_distance = float(lap_state.get("lap_distance_m", 0))
+                track_length = float(self.track_length_m or 0)
+                near_line = new_time <= 5_000 and -200 <= new_distance <= max(250, track_length * 0.05)
+                forward_number = lap_number > old_number
+                wrapped_same_number = bool(
+                    lap_number == old_number
+                    and track_length > 100
+                    and old_distance is not None
+                    and float(old_distance) >= track_length * 0.85
+                    and new_distance <= track_length * 0.05
+                    and old_time is not None
+                    and new_time + 1_000 < int(old_time)
                 )
-                if normal_crossing and self.capture_current_lap:
+                crossed_from_negative = bool(
+                    lap_number == old_number
+                    and old_distance is not None
+                    and -200 <= float(old_distance) < 0 <= new_distance
+                    and new_time <= 5_000
+                )
+                new_lap_started = near_line and (forward_number or wrapped_same_number or crossed_from_negative)
+                completed_lap_available = new_lap_started and int(lap_state.get("last_lap_ms", 0)) >= 30_000
+
+                if completed_lap_available and self.capture_current_lap:
                     self._finish_lap(int(lap_state["last_lap_ms"]))
-                if normal_crossing and self.active_recording_id is not None:
+                if new_lap_started and self.active_recording_id is not None:
                     session = self.sessions[self.active_recording_id]
                     if session.status == "armed":
                         session.status = "recording"
@@ -427,17 +453,16 @@ class SessionStore:
                     capture = session.status == "recording"
                 else:
                     capture = False
-                self._begin_lap(lap_number, capture)
-            else:
-                old_time = self.active_lap_state.get("current_lap_ms")
-                old_distance = self.active_lap_state.get("lap_distance_m")
-                time_reversed = old_time is not None and int(lap_state.get("current_lap_ms", 0)) + 1_000 < int(old_time)
-                distance_reversed = old_distance is not None and float(lap_state.get("lap_distance_m", 0)) + 50 < float(old_distance)
-                if time_reversed or distance_reversed:
-                    self.active_samples = []
-                    self.active_invalid = False
-                    self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
-                    self.capture_current_lap = False
+                if lap_number != old_number or new_lap_started:
+                    self._begin_lap(lap_number, capture)
+                else:
+                    time_reversed = old_time is not None and new_time + 1_000 < int(old_time)
+                    distance_reversed = old_distance is not None and new_distance + 50 < float(old_distance)
+                    if time_reversed or distance_reversed:
+                        self.active_samples = []
+                        self.active_invalid = False
+                        self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
+                        self.capture_current_lap = False
             self.active_invalid = self.active_invalid or bool(lap_state["invalid"])
             self.active_lap_state.update(lap_state)
             self.latest.update(lap_state)
@@ -478,6 +503,7 @@ class SessionStore:
         directory = self.sessions_dir / session.id
         (directory / f"{lap.id}.json").write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         self._persist_session(session)
+        self.pb_registry.consider(lap, session.name, self.notes.get(lap.id, ""))
 
     def list_sessions(self) -> list[dict[str, Any]]:
         with self.lock:
@@ -508,6 +534,13 @@ class SessionStore:
             return [lap.summary(self.notes.get(lap.id, "")) for lap in self.session_laps[selected]]
 
     def get_lap_object(self, lap_id: str) -> Lap | None:
+        if lap_id.startswith("pb:"):
+            entry = self.pb_registry.get(lap_id[3:])
+            if entry is not None:
+                try:
+                    return self._lap_from_payload(entry["lap"])
+                except (TypeError, KeyError, ValueError):
+                    return None
         return next((lap for lap in self.laps if lap.id == lap_id), None)
 
     def lap(self, lap_id: str) -> dict[str, Any] | None:
@@ -528,7 +561,69 @@ class SessionStore:
             else:
                 self.notes.pop(lap_id, None)
             self.notes_path.write_text(json.dumps(self.notes, indent=2, sort_keys=True), encoding="utf-8")
+            self.pb_registry.update_source_note(lap_id, clean_note)
             return {"id": lap_id, "note": clean_note}
+
+    def list_personal_bests(self) -> list[dict[str, Any]]:
+        with self.lock:
+            return [entry | {"track_name": track_name(entry.get("track_id"))} for entry in self.pb_registry.summaries()]
+
+    def personal_best(self, key: str) -> dict[str, Any] | None:
+        with self.lock:
+            return self.pb_registry.get(key)
+
+    def rebuild_personal_bests(self) -> dict[str, int]:
+        with self.lock:
+            return self.pb_registry.rebuild(
+                self.laps,
+                lambda session_id: self.sessions.get(session_id, self.sessions[LEGACY_SESSION_ID]).name,
+                lambda lap_id: self.notes.get(lap_id, ""),
+            )
+
+    def _raw_lap(self, lap: Lap) -> bytes | None:
+        if lap.recording_session_id == LEGACY_SESSION_ID:
+            path = self.capture_dir / f"{lap.id}.json"
+        else:
+            path = self.sessions_dir / lap.recording_session_id / f"{lap.id}.json"
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
+    def export_session(self, session_id: str, scope: str, lap_ids: list[str], export_format: str) -> tuple[str, str, bytes]:
+        from .reports import ExportError, build_markdown, build_zip, safe_filename
+
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise ExportError("Unknown session ID")
+            available = self.session_laps[session_id]
+            if scope == "session":
+                included = list(available)
+            elif scope == "selected":
+                requested = list(dict.fromkeys(lap_ids))
+                if not requested:
+                    raise ExportError("Select at least one lap before exporting")
+                lookup = {lap.id: lap for lap in available}
+                unknown = [lap_id for lap_id in requested if lap_id not in lookup]
+                if unknown:
+                    raise ExportError(f"Lap does not belong to this session: {unknown[0]}")
+                included = [lookup[lap_id] for lap_id in requested]
+            else:
+                raise ExportError("Export scope must be 'session' or 'selected'")
+            if not included:
+                raise ExportError("This export contains no completed laps")
+            report = build_markdown(session, included, self.notes, track_name(session.track_id))
+            base = safe_filename(session.name)
+            if export_format == "markdown":
+                return f"{base}.md", "text/markdown; charset=utf-8", report.encode("utf-8")
+            if export_format == "zip":
+                raw = {lap.id: self._raw_lap(lap) for lap in included}
+                if any(value is None for value in raw.values()):
+                    missing = next(key for key, value in raw.items() if value is None)
+                    raise ExportError(f"Original JSON is unavailable for lap {missing}")
+                return f"{base}.zip", "application/zip", build_zip(report, session, included, raw)  # type: ignore[arg-type]
+            raise ExportError("Export format must be 'markdown' or 'zip'")
 
 
 class UdpReceiver(Thread):

@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .analysis import ComparisonError, compare_laps
 from .receiver import SessionStateError, SessionStore, UdpReceiver
+from .reports import ExportError
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "static"
@@ -34,6 +35,23 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return self._json({"error": str(error)}, 404)
         if path == "/api/sessions":
             return self._json({"sessions": self.store.list_sessions(), **self.store.snapshot()})
+        if path == "/api/personal-bests":
+            return self._json({"personal_bests": self.store.list_personal_bests()})
+        if path.startswith("/api/personal-bests/"):
+            key = unquote(path[len("/api/personal-bests/"):].rstrip("/"))
+            result = self.store.personal_best(key)
+            return self._json(result or {"error": "Personal best not found"}, 200 if result else 404)
+        if path.startswith("/api/sessions/") and path.endswith("/export"):
+            session_id = unquote(path[len("/api/sessions/"):-len("/export")].rstrip("/"))
+            query = parse_qs(request.query)
+            try:
+                filename, content_type, body = self.store.export_session(
+                    session_id, query.get("scope", ["session"])[0], query.get("lap", []),
+                    query.get("format", ["markdown"])[0],
+                )
+                return self._download(body, content_type, filename)
+            except ExportError as error:
+                return self._json({"error": str(error)}, 400 if "Unknown session" not in str(error) else 404)
         if path.startswith("/api/sessions/") and path.endswith("/laps"):
             session_id = unquote(path[len("/api/sessions/"):-len("/laps")].rstrip("/"))
             try:
@@ -71,6 +89,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return self._json(self.store.start_time_trial_run(str(payload.get("name", ""))), 201)
             if path == "/api/recording/stop":
                 return self._json(self.store.stop_recording())
+            if path == "/api/personal-bests/rebuild":
+                return self._json(self.store.rebuild_personal_bests())
             if path == "/api/sessions/select":
                 return self._json(self.store.select_session(str(payload.get("session_id", ""))))
             if path.startswith("/api/sessions/") and path.endswith("/rename"):
@@ -103,6 +123,15 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _download(self, body: bytes, content_type: str, filename: str):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 

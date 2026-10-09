@@ -78,16 +78,76 @@ class ExportTests(unittest.TestCase):
                 "car_status": {"fuel_kg": 42.5, "actual_tyre_compound": 18, "tyre_age_laps": 3, "ers_store_j": 3_100_000},
                 "damage": {"tyre_wear_pct": [8, 9, 10, 11]},
                 "session": {"safety_car_status": 0, "weather": 1},
+            }, "finish": {
+                "lap": {"position": 3, "delta_to_car_in_front_ms": 600, "delta_to_race_leader_ms": 1900, "pit_status": 0},
+                "car_status": {"fuel_kg": 40.2, "actual_tyre_compound": 18, "tyre_age_laps": 3, "ers_store_j": 2_900_000},
+                "damage": {"tyre_wear_pct": [10, 11, 12, 13], "tyre_damage_pct": [0, 0, 0, 0], "tyre_blisters_pct": [0, 0, 0, 0]},
+                "session": {"safety_car_status": 0, "weather": 1},
             }}
+            for sample_row in laps[0].samples:
+                sample_row["tyre_surface_c"] = [88, 89, 90, 91]
+                sample_row["tyre_pressures_psi"] = [21.0, 21.1, 24.0, 24.1]
             _name, _mime, body = store.export_session(session_id, "session", [], "markdown")
             report = body.decode()
             self.assertIn("fuel 42.5 kg", report)
             self.assertIn("gap ahead 750 ms", report)
             self.assertIn("recording_started · recorder", report)
             self.assertIn("Continuous packets: 1", report)
+            self.assertIn("Worst individual high-rate stream", report)
+            self.assertIn("High-rate continuity", report)
             self.assertIn("Packets dropped by storage limit: 0", report)
             self.assertIn("Profile verification: approximate", report)
             self.assertIn("estimated apex", report.lower())
+            self.assertIn("Detailed lap engineering sheets", report)
+            self.assertIn("Tyres, degradation and temperatures", report)
+            self.assertIn("Measured inner temperature maximum", report)
+            self.assertIn("Measured running pressure average", report)
+            self.assertIn("not configured setup pressure", report)
+            self.assertIn("rear left 2.00 percentage points", report)
+            self.assertIn("rear left 21.00 PSI", report)
+            self.assertIn("calculated net used 2.30 kg", report)
+            self.assertIn("Configured starting fuel", report)
+
+    def test_distinct_time_trial_race_and_lap_analysis_reports(self):
+        with TemporaryDirectory() as directory:
+            store, session_id, laps = self._record_session(directory)
+            tt_name, _, tt_body = store.export_session(session_id, "session", [], "markdown", "time_trial")
+            lap_name, _, lap_body = store.export_session(session_id, "selected", [laps[0].id], "markdown", "lap_analysis")
+            self.assertIn("Time Trial Report", tt_body.decode())
+            self.assertIn("Valid-lap consistency", tt_body.decode())
+            self.assertIn("time-trial", tt_name)
+            self.assertIn("Lap Analysis Report", lap_body.decode())
+            self.assertIn("lap-analysis", lap_name)
+            with self.assertRaisesRegex(ExportError, "race session"):
+                store.export_session(session_id, "session", [], "markdown", "race")
+
+            store.sessions[session_id].mode = "race"
+            for lap in laps:
+                lap.mode = "race"
+            race_name, _, race_body = store.export_session(session_id, "session", [], "markdown", "race")
+            self.assertIn("Race Report", race_body.decode())
+            self.assertIn("Stint analysis", race_body.decode())
+            self.assertIn("race", race_name)
+
+    def test_direct_comparison_report_contains_turn_and_lap_detail(self):
+        with TemporaryDirectory() as directory:
+            store, _session_id, laps = self._record_session(directory)
+            name, mime, body = store.export_lap_analysis(laps[0].id, laps[0].id)
+            report = body.decode()
+            self.assertEqual(mime, "text/markdown; charset=utf-8")
+            self.assertIn("Lap Analysis Report", report)
+            self.assertIn("Circuit-profile turn analysis", report)
+            self.assertIn("Baseline engineering sheet", report)
+            self.assertIn("analysis", name)
+
+    def test_direct_comparison_report_warns_for_game_invalid_lap(self):
+        with TemporaryDirectory() as directory:
+            store, _session_id, laps = self._record_session(directory)
+            _name, _mime, body = store.export_lap_analysis(laps[0].id, laps[1].id)
+            report = body.decode()
+            self.assertIn("Comparison warnings and data quality", report)
+            self.assertIn("Candidate is game-invalid", report)
+            self.assertIn("diagnosis only", report)
 
     def test_empty_selection_is_rejected(self):
         with TemporaryDirectory() as directory:

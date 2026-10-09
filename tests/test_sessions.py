@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
+from src.f1telemetry.circuit_profiles import CircuitProfileError
 from src.f1telemetry.receiver import LEGACY_SESSION_ID, SessionStore, UdpReceiver
 
 
@@ -44,6 +45,109 @@ def fill_lap(store, uid, number, time_ms=90_000):
 
 
 class RecordingSessionTests(unittest.TestCase):
+    def test_packet_failure_is_reported_without_escaping_receiver_loop(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            receiver = UdpReceiver(store)
+            with patch.object(receiver, "_handle", side_effect=OverflowError("test packet")):
+                self.assertFalse(receiver._handle_safely(b"packet"))
+            self.assertEqual(store.latest["receiver_error_count"], 1)
+            self.assertEqual(store.latest["receiver_error"], "OverflowError: test packet")
+
+    def test_closed_session_deletion_is_recoverable_and_preserves_pb_and_note(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(1, 40_000, 2_500), UID)
+            run = store.start_time_trial_run("delete me")
+            store.record_lap_state(lap_state(2, 0, 0, 90_000), UID)
+            fill_lap(store, UID, 2, 89_000)
+            lap = store.session_laps[run["id"]][0]
+            store.set_note(lap.id, "keep this note")
+            pb_path = root / "personal_bests" / "track-7__time_trial.json"
+            self.assertTrue(pb_path.exists())
+
+            with self.assertRaisesRegex(ValueError, "explicitly confirmed"):
+                store.delete_session(run["id"])
+            with self.assertRaisesRegex(ValueError, "Stop the active recording"):
+                store.delete_session(run["id"], True)
+            store.stop_recording()
+            result = store.delete_session(run["id"], True)
+
+            self.assertTrue(result["recoverable"])
+            self.assertTrue(result["personal_bests_preserved"])
+            self.assertTrue(result["notes_preserved"])
+            self.assertFalse((root / "sessions" / run["id"]).exists())
+            trashed = root / result["moved_to"]
+            self.assertTrue((trashed / "session.json").exists())
+            deletion = json.loads((trashed / "deletion.json").read_text())
+            self.assertEqual(deletion["session"]["id"], run["id"])
+            self.assertIn(lap.id, deletion["lap_ids"])
+            self.assertNotIn(run["id"], store.sessions)
+            self.assertIsNone(store.get_lap_object(lap.id))
+            self.assertEqual(store.selected_session_id, LEGACY_SESSION_ID)
+            self.assertTrue(pb_path.exists())
+            self.assertEqual(store.notes[lap.id], "keep this note")
+
+            reloaded = SessionStore(root)
+            self.assertNotIn(run["id"], reloaded.sessions)
+            self.assertIsNotNone(reloaded.personal_best("track-7__time_trial"))
+            self.assertEqual(reloaded.notes[lap.id], "keep this note")
+
+    def test_legacy_session_cannot_be_deleted(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            with self.assertRaisesRegex(ValueError, "Legacy captures cannot be deleted"):
+                store.delete_session(LEGACY_SESSION_ID, True)
+
+    def test_deleted_session_can_be_listed_and_restored_without_restart(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(1, 40_000, 2_500), UID)
+            run = store.start_time_trial_run("restore me")
+            store.record_lap_state(lap_state(2, 0, 0, 90_000), UID)
+            fill_lap(store, UID, 2)
+            store.stop_recording()
+            deleted = store.delete_session(run["id"], True)
+            entries = store.list_deleted_sessions()
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0]["session_id"], run["id"])
+            self.assertIsNotNone(entries[0]["purge_at"])
+
+            restored = store.restore_deleted_session(entries[0]["trash_id"], True)
+            self.assertEqual(restored["restored_session_id"], run["id"])
+            self.assertEqual(restored["lap_count"], 1)
+            self.assertIn(run["id"], store.sessions)
+            self.assertTrue((root / "sessions" / run["id"] / "deletion.json").exists())
+            self.assertFalse((root / deleted["moved_to"]).exists())
+
+    def test_expired_deleted_session_is_permanently_purged_by_retention_setting(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.record_game_session(game())
+            run = store.start_time_trial_run("expire me")
+            store.stop_recording()
+            deleted = store.delete_session(run["id"], True)
+            trash = root / deleted["moved_to"]
+            record = json.loads((trash / "deletion.json").read_text())
+            record["deleted_at"] = "2020-01-01T00:00:00Z"
+            (trash / "deletion.json").write_text(json.dumps(record))
+
+            result = store.update_settings({"trash_retention_days": 1})
+            self.assertIn(trash.name, result["purge"]["purged"])
+            self.assertFalse(trash.exists())
+
+    def test_zero_retention_keeps_deleted_sessions_until_restored(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            saved = store.update_settings({"trash_retention_days": 0})
+            self.assertEqual(saved["settings"]["trash_retention_days"], 0)
+            self.assertEqual(saved["restart_required"], [])
+
     def test_opt_in_diagnostic_records_staggered_boundary_decisions(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -322,6 +426,51 @@ class RecordingSessionTests(unittest.TestCase):
             self.assertIsNone(store.active_recording_id)
             self.assertEqual(store.sessions[active].status, "stopped")
 
+    def test_race_finish_uid_glitch_does_not_create_empty_duplicate(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="race"))
+            race_id = store.active_recording_id
+
+            # Observed live finish ordering: a transient UID closes the real
+            # race, then 16 ms later a complete packet bundle arrives using
+            # the just-completed race UID, beginning with Session data.
+            store.record_telemetry(telemetry(), 557.620, UID + 99)
+            self.assertIsNone(store.active_recording_id)
+            self.assertEqual(store.sessions[race_id].status, "completed")
+
+            store.record_game_session(game(uid=UID, mode="race"))
+            self.assertIsNone(store.active_recording_id)
+            self.assertEqual(
+                [session.id for session in store.sessions.values() if session.mode == "race"],
+                [race_id],
+            )
+
+            # The guard is specific to the completed UID; a genuinely new
+            # game session still starts its own race immediately.
+            store.record_game_session(game(uid=UID + 200, mode="race"))
+            self.assertIsNotNone(store.active_recording_id)
+            self.assertNotEqual(store.active_recording_id, race_id)
+
+    def test_profile_deletion_clears_session_reference_and_is_recoverable(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.record_game_session(game(mode="race", track_id=10, track_length=7_004))
+            session_id = store.active_recording_id
+            profile = store.save_profile({
+                "id": "spa-editable-v1", "packet_format": 2025, "track_id": 10,
+                "layout": "normal", "measured_game_length_m": 7_004,
+                "turns": [{"number": 1, "entry_m": 50, "estimated_apex_m": 100, "exit_m": 150}],
+            })
+            store.select_profile(session_id, profile["id"])
+            with self.assertRaisesRegex(CircuitProfileError, "explicitly confirmed"):
+                store.delete_profile(profile["id"])
+            result = store.delete_profile(profile["id"], True)
+            self.assertEqual(result["cleared_session_ids"], [session_id])
+            self.assertIsNone(store.sessions[session_id].circuit_profile_id)
+            self.assertTrue((root / result["moved_to"]).exists())
+
     def test_live_race_grid_packet_captures_lap_one_from_nonzero_start_position(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
@@ -405,7 +554,7 @@ class RecordingSessionTests(unittest.TestCase):
             self.assertEqual(lap.setup, payload["setup"])
             self.assertNotIn("front_camber", lap.setup)
 
-    def test_setup_is_snapshotted_at_lap_start(self):
+    def test_setup_refreshes_during_opening_window_then_is_frozen(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
             store.record_game_session(game())
@@ -416,13 +565,14 @@ class RecordingSessionTests(unittest.TestCase):
             run = store.start_time_trial_run("setup test")
             for index in range(15):
                 store.record_telemetry(telemetry(), index, UID)
-            store.record_setup(second_setup, UID)
+            store.record_setup(second_setup, UID, {"session_time": 0.5, "frame_identifier": 90})
             for index in range(15, 30):
                 store.record_telemetry(telemetry(), index, UID)
             store.record_lap_state(lap_state(2, 0, 0, 90_000), UID)
             captured = store.session_laps[run["id"]][0].setup
-            self.assertEqual({key: captured[key] for key in first_setup}, first_setup)
-            self.assertTrue(all(captured["_provenance"][key] == "decoded_udp" for key in first_setup))
+            self.assertEqual({key: captured[key] for key in second_setup}, second_setup)
+            self.assertEqual(captured["_capture"]["frame_identifier"], 90)
+            self.assertTrue(all(captured["_provenance"][key] == "decoded_udp" for key in second_setup))
 
     def test_historical_setup_amendment_backs_up_and_syncs_pb(self):
         with TemporaryDirectory() as directory:

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import shutil
 import socket
 import sqlite3
 from threading import Event, Lock, Thread
@@ -14,7 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from .circuits import is_known_track, track_name
-from .circuit_profiles import CircuitProfileStore, profile_identity
+from .circuit_profiles import CircuitProfileError, CircuitProfileStore, profile_identity
 from .protocol import (
     PACKET_CAR_DAMAGE, PACKET_CAR_SETUPS, PACKET_CAR_STATUS, PACKET_CAR_TELEMETRY,
     PACKET_EVENT, PACKET_FINAL_CLASSIFICATION, PACKET_LAP_DATA, PACKET_MOTION,
@@ -26,9 +27,11 @@ from .personal_bests import PersonalBestRegistry
 from .quality import lap_quality
 from .race_store import RaceSessionStore
 from .setups import SetupValidationError, setup_rows, validate_manual_values, with_provenance
+from .settings import SettingsStore
 
 LEGACY_SESSION_ID = "legacy"
 OPEN_STATUSES = {"armed", "recording"}
+RACE_UID_REOPEN_GUARD_SECONDS = 5.0
 MAX_DIAGNOSTIC_SEGMENTS = 8
 MAX_DIAGNOSTIC_EVENTS = 50_000
 MAX_DIAGNOSTIC_BYTES = 50 * 1024 * 1024
@@ -159,6 +162,8 @@ class SessionStore:
         self.sessions_dir = self.capture_dir / "sessions"
         self.sessions_dir.mkdir(exist_ok=True)
         self.notes_path = self.capture_dir / "notes.json"
+        self.settings_store = SettingsStore(self.capture_dir / "settings.json")
+        self.settings = self.settings_store.load()
         self.pb_registry = PersonalBestRegistry(self.capture_dir / "personal_bests")
         self.profile_store = CircuitProfileStore(self.capture_dir / "circuit_profiles")
         self.lock = Lock()
@@ -178,6 +183,7 @@ class SessionStore:
         self.active_recording_id: str | None = None
         self.selected_session_id: str | None = None
         self.manual_stop_uid: int | None = None
+        self.race_uid_reopen_guard: dict[int, float] = {}
         self.current_setup: dict[str, Any] | None = None
         self.active_lap_number: int | None = None
         self.active_invalid = False
@@ -196,6 +202,7 @@ class SessionStore:
         self.diagnostic_events = 0
         self.diagnostic_bytes = 0
         self.diagnostic_truncated = False
+        self._purge_expired_trash_unlocked()
         self._load_all()
 
     def _load_notes(self) -> dict[str, str]:
@@ -271,6 +278,16 @@ class SessionStore:
         self.latest["connected"] = True
         self.last_packet_at = monotonic()
 
+    def record_receiver_error(self, error: Exception) -> None:
+        """Expose a packet failure without allowing the UDP thread to die silently."""
+        with self.lock:
+            count = int(self.latest.get("receiver_error_count", 0)) + 1
+            self.latest.update({
+                "receiver_error_count": count,
+                "receiver_error": f"{type(error).__name__}: {error}",
+                "receiver_error_at": utc_now(),
+            })
+
     def _observe_uid(self, session_uid: int | None) -> None:
         if session_uid is None:
             return
@@ -279,7 +296,14 @@ class SessionStore:
             return
         if session_uid == self.game_session_uid:
             return
+        previous_uid = self.game_session_uid
+        active = self.sessions.get(self.active_recording_id or "")
         self._close_active("completed")
+        if active is not None and active.mode == "race" and previous_uid is not None:
+            # At race finish F1 25 can emit a momentary different UID before a
+            # final bundle from the completed UID. Do not let that trailing
+            # Session packet create a second empty automatic recording.
+            self.race_uid_reopen_guard[previous_uid] = monotonic() + RACE_UID_REOPEN_GUARD_SECONDS
         self._reset_lap()
         self.game_session_uid = session_uid
         self.game_mode, self.game_session_type = "unknown", None
@@ -310,7 +334,18 @@ class SessionStore:
                 "track_length_m": self.track_length_m, "track_name": track_name(self.track_id),
             })
             self._touch()
-            if self.game_mode == "race" and self.active_recording_id is None and self.manual_stop_uid != self.game_session_uid:
+            now = monotonic()
+            self.race_uid_reopen_guard = {
+                uid: expires for uid, expires in self.race_uid_reopen_guard.items()
+                if expires > now
+            }
+            guarded_tail = self.race_uid_reopen_guard.get(self.game_session_uid, 0) > now
+            if (
+                self.game_mode == "race"
+                and self.active_recording_id is None
+                and self.manual_stop_uid != self.game_session_uid
+                and not guarded_tail
+            ):
                 self._create_recording(f"Race · {track_name(self.track_id)}", "race", automatic=True)
 
     def game_session_ended(self, session_uid: int) -> None:
@@ -358,7 +393,10 @@ class SessionStore:
             self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
             self.active_invalid = bool(self.active_lap_state.get("invalid", False))
         self._persist_session(session)
-        self.race_store = RaceSessionStore(self.sessions_dir / session.id / "race-data.sqlite3")
+        self.race_store = RaceSessionStore(
+            self.sessions_dir / session.id / "race-data.sqlite3",
+            max_bytes=int(float(self.settings["max_recording_gb"]) * 1024**3),
+        )
         self.race_store.set_metadata("recording_session_id", session.id)
         self.race_store.set_metadata("mode", session.mode)
         self.race_store.set_metadata("track_id", session.track_id)
@@ -399,7 +437,7 @@ class SessionStore:
             "limits": {
                 "segments": MAX_DIAGNOSTIC_SEGMENTS,
                 "events_per_segment": MAX_DIAGNOSTIC_EVENTS,
-                "bytes_per_segment": MAX_DIAGNOSTIC_BYTES,
+                "bytes_per_segment": int(self.settings["diagnostic_max_mb"]) * 1024 * 1024,
             },
         }
 
@@ -440,7 +478,8 @@ class SessionStore:
         if not self.diagnostics_enabled or self.active_recording_id is None or self.diagnostic_path is None or self.diagnostic_truncated:
             return
         line = (json.dumps(event, separators=(",", ":")) + "\n").encode("utf-8")
-        if self.diagnostic_events >= MAX_DIAGNOSTIC_EVENTS or self.diagnostic_bytes + len(line) > MAX_DIAGNOSTIC_BYTES:
+        diagnostic_max_bytes = int(self.settings["diagnostic_max_mb"]) * 1024 * 1024
+        if self.diagnostic_events >= MAX_DIAGNOSTIC_EVENTS or self.diagnostic_bytes + len(line) > diagnostic_max_bytes:
             self.diagnostic_truncated = True
             marker = json.dumps({
                 "event": "diagnostic_limit_reached", "timestamp_utc": self._diagnostic_timestamp(),
@@ -516,6 +555,160 @@ class SessionStore:
             self._persist_session(session)
             return session.summary(self.session_laps[session.id])
 
+    def delete_session(self, session_id: str, confirmed: bool = False) -> dict[str, Any]:
+        """Remove a closed session from the library by atomically moving it to local trash."""
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                raise SessionStateError("Unknown session ID")
+            if not confirmed:
+                raise SessionStateError("Session deletion must be explicitly confirmed")
+            if session.id == LEGACY_SESSION_ID:
+                raise SessionStateError("Legacy captures cannot be deleted")
+            if session.id == self.active_recording_id or session.status in OPEN_STATUSES:
+                raise SessionStateError("Stop the active recording before deleting this session")
+
+            source = self.sessions_dir / session.id
+            if not source.is_dir():
+                raise SessionStateError("Session directory is unavailable; nothing was deleted")
+            trash_dir = self.capture_dir / "trash" / "sessions"
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            destination = trash_dir / f"{session.id}--deleted-{stamp}-{uuid4().hex[:8]}"
+            try:
+                trash_dir.mkdir(parents=True, exist_ok=True)
+                source.replace(destination)
+            except OSError as error:
+                raise SessionStateError("Could not move the session to local trash") from error
+            try:
+                self._atomic_json(destination / "deletion.json", {
+                    "deleted_at": utc_now(),
+                    "original_path": str(Path("sessions") / session.id),
+                    "session": asdict(session),
+                    "lap_ids": [lap.id for lap in self.session_laps.get(session.id, [])],
+                    "personal_bests_preserved": True,
+                    "notes_preserved": True,
+                })
+            except OSError as error:
+                destination.replace(source)
+                raise SessionStateError("Could not create a recoverable deletion record") from error
+
+            self.sessions.pop(session.id)
+            self.session_laps.pop(session.id, None)
+            self._refresh_lap_index()
+            if self.selected_session_id == session.id:
+                remaining = [item for item in self.sessions.values() if item.id != LEGACY_SESSION_ID]
+                self.selected_session_id = (
+                    max(remaining, key=lambda item: item.started_at).id
+                    if remaining else LEGACY_SESSION_ID
+                )
+            return {
+                "deleted_session_id": session.id,
+                "recoverable": True,
+                "moved_to": str(destination.relative_to(self.capture_dir)),
+                "selected_session_id": self.selected_session_id,
+                "personal_bests_preserved": True,
+                "notes_preserved": True,
+            }
+
+    @staticmethod
+    def _parse_utc(value: Any) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    def list_deleted_sessions(self) -> list[dict[str, Any]]:
+        trash_dir = self.capture_dir / "trash" / "sessions"
+        retention = int(self.settings["trash_retention_days"])
+        result = []
+        for path in sorted(trash_dir.glob("*"), reverse=True) if trash_dir.exists() else []:
+            if not path.is_dir():
+                continue
+            try:
+                deletion = json.loads((path / "deletion.json").read_text(encoding="utf-8"))
+                session = deletion.get("session") or json.loads((path / "session.json").read_text(encoding="utf-8"))
+                deleted_at = self._parse_utc(deletion.get("deleted_at"))
+                if deleted_at is None:
+                    deleted_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+                purge_at = deleted_at + timedelta(days=retention) if retention else None
+                result.append({
+                    "trash_id": path.name, "session_id": session.get("id"),
+                    "name": session.get("name", session.get("id", path.name)),
+                    "mode": session.get("mode", "unknown"), "track_id": session.get("track_id"),
+                    "started_at": session.get("started_at"), "deleted_at": deleted_at.isoformat().replace("+00:00", "Z"),
+                    "purge_at": purge_at.isoformat().replace("+00:00", "Z") if purge_at else None,
+                    "lap_count": len(deletion.get("lap_ids") or session.get("lap_ids") or []),
+                })
+            except (OSError, ValueError, TypeError):
+                continue
+        return result
+
+    def restore_deleted_session(self, trash_id: str, confirmed: bool = False) -> dict[str, Any]:
+        if not confirmed:
+            raise SessionStateError("Session restoration must be explicitly confirmed")
+        if not trash_id or Path(trash_id).name != trash_id:
+            raise SessionStateError("Invalid deleted-session ID")
+        with self.lock:
+            source = self.capture_dir / "trash" / "sessions" / trash_id
+            if not source.is_dir():
+                raise SessionStateError("Deleted session was not found; it may already have expired")
+            try:
+                payload = json.loads((source / "session.json").read_text(encoding="utf-8"))
+                session_fields = {item.name for item in fields(RecordingSession)}
+                session = RecordingSession(**{key: value for key, value in payload.items() if key in session_fields})
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                raise SessionStateError("Deleted session metadata is unreadable") from error
+            destination = self.sessions_dir / session.id
+            if destination.exists() or session.id in self.sessions:
+                raise SessionStateError(f"Cannot restore: session {session.id} already exists")
+            source.replace(destination)
+            try:
+                laps = []
+                for lap_path in sorted(destination.glob("lap-*.json")):
+                    lap_payload = json.loads(lap_path.read_text(encoding="utf-8"))
+                    laps.append(self._lap_from_payload(lap_payload, {
+                        "recording_session_id": session.id, "game_session_uid": session.game_session_uid,
+                        "mode": session.mode, "track_id": session.track_id, "track_length_m": session.track_length_m,
+                    }))
+                session.lap_ids = [lap.id for lap in laps]
+                self.sessions[session.id], self.session_laps[session.id] = session, laps
+                self.selected_session_id = session.id
+                self._refresh_lap_index()
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                destination.replace(source)
+                raise SessionStateError("Could not load the restored session") from error
+            return {"restored_session_id": session.id, "selected_session_id": session.id, "lap_count": len(laps)}
+
+    def _purge_expired_trash_unlocked(self) -> dict[str, Any]:
+        retention = int(self.settings.get("trash_retention_days", 30))
+        if retention == 0:
+            return {"purged": [], "retention_days": 0}
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention)
+        purged = []
+        trash_dir = self.capture_dir / "trash" / "sessions"
+        for item in self.list_deleted_sessions():
+            deleted_at = self._parse_utc(item.get("deleted_at"))
+            if deleted_at is None or deleted_at > cutoff:
+                continue
+            target = trash_dir / item["trash_id"]
+            if target.is_dir() and target.parent == trash_dir:
+                shutil.rmtree(target)
+                purged.append(item["trash_id"])
+        return {"purged": purged, "retention_days": retention}
+
+    def purge_expired_trash(self) -> dict[str, Any]:
+        with self.lock:
+            return self._purge_expired_trash_unlocked()
+
+    def update_settings(self, values: Any) -> dict[str, Any]:
+        with self.lock:
+            previous = dict(self.settings)
+            self.settings = self.settings_store.save(values)
+            purge = self._purge_expired_trash_unlocked()
+            restart_fields = [key for key in ("web_host", "web_port", "udp_port") if previous.get(key) != self.settings.get(key)]
+            return {"settings": dict(self.settings), "restart_required": restart_fields, "purge": purge}
+
     def override_track_name(self, session_id: str, name: str) -> dict[str, Any]:
         with self.lock:
             session = self.sessions.get(session_id)
@@ -540,16 +733,23 @@ class SessionStore:
             self.selected_session_id = session_id
             return session.summary(self.session_laps[session_id])
 
-    def record_setup(self, setup: dict[str, Any], session_uid: int | None = None) -> None:
+    def record_setup(
+        self, setup: dict[str, Any], session_uid: int | None = None,
+        packet_meta: dict[str, Any] | None = None,
+    ) -> None:
         with self.lock:
             self._observe_uid(session_uid)
             decoded = with_provenance(setup, "decoded_udp") or {}
+            if packet_meta:
+                decoded["_capture"] = dict(packet_meta)
             self.current_setup = decoded
             if (
                 self.capture_current_lap
-                and self.active_lap_setup is None
                 and float(self.active_lap_state.get("current_lap_ms", 0)) <= 1_500
             ):
+                # Grid/pre-session setup packets can precede the applied race
+                # setup. Keep refreshing only in the opening 1.5 s, then freeze
+                # the lap snapshot so later setup packets cannot rewrite it.
                 self.active_lap_setup = dict(decoded)
             self.latest.update(setup)
             self.latest["setup"] = dict(decoded)
@@ -879,6 +1079,7 @@ class SessionStore:
             }
             motion = self.packet_state.get(PACKET_MOTION, {}).get("player")
             motion_ex = self.packet_state.get(PACKET_MOTION_EX)
+            status = self.packet_state.get(PACKET_CAR_STATUS, {}).get("player")
             if isinstance(motion, dict):
                 sample.update({key: motion.get(key) for key in ("world_x", "world_y", "world_z", "yaw", "g_lateral", "g_longitudinal")})
             if isinstance(motion_ex, dict):
@@ -891,6 +1092,10 @@ class SessionStore:
                 if isinstance(slip_angle, list) and len(slip_angle) == 4:
                     sample["front_wheel_slip_angle"] = sum(abs(float(value)) for value in slip_angle[2:4]) / 2
                     sample["rear_wheel_slip_angle"] = sum(abs(float(value)) for value in slip_angle[0:2]) / 2
+            if isinstance(status, dict):
+                sample.update({key: status.get(key) for key in (
+                    "ers_store_j", "ers_deployed_this_lap_j", "ers_harvested_mguk_j", "ers_harvested_mguh_j",
+                )})
             if self.capture_current_lap and self.active_lap_number is not None:
                 self.active_samples.append(sample)
             self.latest.update(sample)
@@ -919,9 +1124,16 @@ class SessionStore:
                     "PENA": "penalty", "SPTP": "speed_trap", "STLG": "start_lights",
                     "LGOT": "lights_out", "DTSV": "drive_through_served", "SGSV": "stop_go_served",
                     "FLBK": "flashback", "RDFL": "red_flag", "OVTK": "overtake",
-                    "SCAR": "safety_car", "COLL": "collision",
+                    "SCAR": "safety_car", "COLL": "collision", "BUTN": "controller_input",
                 }
-                self.race_store.append_event(header.session_time, event_names.get(code, code.lower()), payload, "udp_event", lap_number)
+                event_details = dict(payload)
+                event_details["_packet"] = {
+                    "frame_identifier": int(header.frame_identifier),
+                    "overall_frame_identifier": int(header.overall_frame_identifier),
+                    "player_car_index": int(header.player_car_index),
+                    "session_uid": int(header.session_uid),
+                }
+                self.race_store.append_event(header.session_time, event_names.get(code, code.lower()), event_details, "udp_event", lap_number)
             elif header.packet_id == PACKET_LAP_DATA and isinstance(player, dict):
                 old_player = previous.get("player") if isinstance(previous, dict) else None
                 if isinstance(old_player, dict):
@@ -945,7 +1157,11 @@ class SessionStore:
             elif header.packet_id == PACKET_CAR_DAMAGE and isinstance(player, dict):
                 old_player = previous.get("player") if isinstance(previous, dict) else None
                 if isinstance(old_player, dict) and old_player != player:
-                    changed = {key: {"from": old_player.get(key), "to": value} for key, value in player.items() if key != "car_index" and old_player.get(key) != value}
+                    # Wear is a continuous engineering channel, not a collision
+                    # or damage event. Keep it in packet/lap data without
+                    # flooding the race-event timeline every few seconds.
+                    noisy = {"car_index", "tyre_wear_pct", "tyre_damage_pct"}
+                    changed = {key: {"from": old_player.get(key), "to": value} for key, value in player.items() if key not in noisy and old_player.get(key) != value}
                     if changed:
                         self.race_store.append_event(header.session_time, "damage_change", changed, "inferred", lap_number)
 
@@ -990,25 +1206,23 @@ class SessionStore:
 
     def _session_summary(self, session: RecordingSession) -> dict[str, Any]:
         result = session.summary(self.session_laps[session.id])
+        result["can_delete"] = (
+            session.id != LEGACY_SESSION_ID
+            and session.id != self.active_recording_id
+            and session.status not in OPEN_STATUSES
+        )
         if session.id == self.active_recording_id and self.race_store is not None:
             result["continuous_store"] = self.race_store.summary()
         elif session.race_store_file:
             path = self.sessions_dir / session.id / session.race_store_file
             if path.exists():
-                try:
-                    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-                    packet_count = connection.execute("SELECT COUNT(*) FROM packets").fetchone()[0]
-                    event_count = connection.execute("SELECT COUNT(*) FROM timeline").fetchone()[0]
-                    metadata = dict(connection.execute("SELECT key,value FROM metadata"))
-                    connection.close()
-                    result["continuous_store"] = {
-                        "path": session.race_store_file, "packet_count": packet_count, "event_count": event_count,
-                        "bytes": path.stat().st_size,
-                        "missing_frame_estimate": int(metadata.get("missing_frame_estimate", 0)),
-                        "dropped_packets": int(metadata.get("dropped_packets", 0)),
-                    }
-                except sqlite3.Error:
-                    result["continuous_store"] = {"path": session.race_store_file, "error": "unreadable"}
+                # The library endpoint is polled frequently. Do not scan every
+                # historical SQLite packet table just to draw session cards;
+                # detailed continuity is calculated on explicit report export.
+                result["continuous_store"] = {
+                    "path": session.race_store_file, "bytes": path.stat().st_size,
+                    "details_deferred": True,
+                }
         return result
 
     def list_profiles(self, session_id: str | None = None) -> list[dict[str, Any]]:
@@ -1019,6 +1233,20 @@ class SessionStore:
     def save_profile(self, payload: Any) -> dict[str, Any]:
         with self.lock:
             return self.profile_store.save(payload)
+
+    def delete_profile(self, profile_id: str, confirmed: bool = False) -> dict[str, Any]:
+        with self.lock:
+            if not confirmed:
+                raise CircuitProfileError("Circuit profile deletion must be explicitly confirmed")
+            result = self.profile_store.delete(profile_id)
+            affected = []
+            for session in self.sessions.values():
+                if session.circuit_profile_id == profile_id:
+                    session.circuit_profile_id = None
+                    self._persist_session(session)
+                    affected.append(session.id)
+            result["cleared_session_ids"] = affected
+            return result
 
     def select_profile(self, session_id: str, profile_id: str) -> dict[str, Any]:
         with self.lock:
@@ -1214,7 +1442,10 @@ class SessionStore:
         except OSError:
             return None
 
-    def export_session(self, session_id: str, scope: str, lap_ids: list[str], export_format: str) -> tuple[str, str, bytes]:
+    def export_session(
+        self, session_id: str, scope: str, lap_ids: list[str], export_format: str,
+        report_type: str = "auto",
+    ) -> tuple[str, str, bytes]:
         from .reports import ExportError, build_markdown, build_zip, safe_filename
 
         with self.lock:
@@ -1247,13 +1478,22 @@ class SessionStore:
                     )
                 except SessionStateError:
                     timeline = None
-            storage_summary = self._session_summary(session).get("continuous_store")
+            if session.id == self.active_recording_id and self.race_store is not None:
+                storage_summary = self.race_store.summary()
+            elif continuous_path and continuous_path.exists():
+                try:
+                    storage_summary = RaceSessionStore.read_summary(continuous_path)
+                except sqlite3.Error:
+                    storage_summary = {"path": session.race_store_file, "error": "unreadable"}
+            else:
+                storage_summary = None
             circuit_profile = self.profile_store.get(session.circuit_profile_id) if session.circuit_profile_id else None
             report = build_markdown(
                 session, included, self.notes, track_name(session.track_id, session.track_name_override),
-                timeline, storage_summary, circuit_profile,
+                timeline, storage_summary, circuit_profile, report_type,
             )
-            base = safe_filename(session.name)
+            resolved_type = report_type if report_type != "auto" else ("race" if session.mode == "race" else "time_trial" if session.mode == "time_trial" else "lap_analysis")
+            base = safe_filename(f"{session.name}-{resolved_type.replace('_', '-')}")
             if export_format == "markdown":
                 return f"{base}.md", "text/markdown; charset=utf-8", report.encode("utf-8")
             if export_format == "zip":
@@ -1283,6 +1523,32 @@ class SessionStore:
                 )  # type: ignore[arg-type]
             raise ExportError("Export format must be 'markdown' or 'zip'")
 
+    def export_lap_analysis(self, baseline_id: str, candidate_id: str) -> tuple[str, str, bytes]:
+        from .reports import build_lap_analysis_markdown, safe_filename
+
+        with self.lock:
+            baseline, candidate = self.get_lap_object(baseline_id), self.get_lap_object(candidate_id)
+            if baseline is None or candidate is None:
+                missing = baseline_id if baseline is None else candidate_id
+                raise ExportError(f"Unknown lap ID: {missing}")
+            session = self.sessions.get(baseline.recording_session_id)
+            candidate_session = self.sessions.get(candidate.recording_session_id)
+            profile = self.profile_store.get(session.circuit_profile_id) if session and session.circuit_profile_id else None
+            if profile is None and candidate_session and candidate_session.circuit_profile_id:
+                profile = self.profile_store.get(candidate_session.circuit_profile_id)
+            if (
+                baseline.mode == candidate.mode == "race"
+                and baseline.recording_session_id != candidate.recording_session_id
+                and (not session or not candidate_session or session.circuit_profile_id != candidate_session.circuit_profile_id)
+            ):
+                raise ExportError("Cross-session race laps must select the same verified circuit profile")
+            report = build_lap_analysis_markdown(
+                baseline, candidate, self.notes.get(baseline.id, ""), self.notes.get(candidate.id, ""),
+                track_name(baseline.track_id), profile,
+            )
+            filename = safe_filename(f"{track_name(baseline.track_id)}-lap-{baseline.number}-vs-{candidate.number}-analysis")
+            return f"{filename}.md", "text/markdown; charset=utf-8", report.encode("utf-8")
+
 
 class UdpReceiver(Thread):
     def __init__(self, store: SessionStore, port: int = 20777) -> None:
@@ -1301,7 +1567,17 @@ class UdpReceiver(Thread):
                     data, _address = sock.recvfrom(8192)
                 except TimeoutError:
                     continue
-                self._handle(data)
+                self._handle_safely(data)
+
+    def _handle_safely(self, data: bytes) -> bool:
+        try:
+            self._handle(data)
+            return True
+        except Exception as error:
+            # A malformed packet or persistence failure must not stop every
+            # subsequent lap from being received.
+            self.store.record_receiver_error(error)
+            return False
 
     def _handle(self, data: bytes) -> None:
         header = decode_header(data)
@@ -1327,7 +1603,11 @@ class UdpReceiver(Thread):
         elif header.packet_id == PACKET_CAR_SETUPS:
             setup = decode_player_setup(data, header)
             if setup:
-                self.store.record_setup(setup, header.session_uid)
+                self.store.record_setup(setup, header.session_uid, {
+                    "session_time": round(float(header.session_time), 6),
+                    "frame_identifier": int(header.frame_identifier),
+                    "overall_frame_identifier": int(header.overall_frame_identifier),
+                })
         decoded = decode_packet(data, header)
         if decoded is not None:
             self.store.record_full_packet(header, decoded)

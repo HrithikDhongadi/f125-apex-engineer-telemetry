@@ -29,7 +29,7 @@ SETUP_FIELDS = (
     {"key": "front_left_tyre_pressure_psi", "label": "Front-left configured tyre pressure", "type": "float", "min": 10, "max": 40, "unit": "PSI"},
     {"key": "front_right_tyre_pressure_psi", "label": "Front-right configured tyre pressure", "type": "float", "min": 10, "max": 40, "unit": "PSI"},
     {"key": "ballast", "label": "Ballast", "type": "int", "min": 0, "max": 50, "unit": ""},
-    {"key": "fuel_load_kg", "label": "Fuel load", "type": "float", "min": 0, "max": 150, "unit": "kg"},
+    {"key": "fuel_load_kg", "label": "Configured starting fuel load", "type": "float", "min": 0, "max": 150, "unit": "kg"},
 )
 SETUP_FIELD_MAP = {field["key"]: field for field in SETUP_FIELDS}
 SETUP_KEYS = tuple(SETUP_FIELD_MAP)

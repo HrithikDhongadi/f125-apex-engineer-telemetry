@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,42 @@ def layout_for_track(track_id: int) -> str:
 
 def profile_identity(packet_format: int, track_id: int, layout: str | None = None) -> str:
     return f"f1-{packet_format}-track-{track_id}-{layout or layout_for_track(track_id)}-v{PROFILE_SCHEMA_VERSION}"
+
+
+def profile_audit(profile: dict[str, Any] | None) -> dict[str, Any]:
+    """Separate a profile-level label from per-corner calibration evidence."""
+    if not profile:
+        return {"ready_for_corner_analysis": False, "warnings": ["No circuit profile selected."], "overlaps": []}
+    turns = [turn for turn in profile.get("turns", []) if isinstance(turn, dict)]
+    unverified = [str(turn.get("number", "?")) for turn in turns if turn.get("verification_status") != "verified"]
+    unnamed = [str(turn.get("number", "?")) for turn in turns if not str(turn.get("name") or "").strip() or str(turn.get("name") or "").lower() == "suggested turn"]
+    overlaps = []
+    ordered = sorted(turns, key=lambda turn: float(turn.get("entry_m", 0)))
+    for left, right in zip(ordered, ordered[1:]):
+        if float(right.get("entry_m", 0)) < float(left.get("exit_m", 0)):
+            overlaps.append({
+                "left": str(left.get("number", "?")), "right": str(right.get("number", "?")),
+                "overlap_m": round(float(left["exit_m"]) - float(right["entry_m"]), 1),
+            })
+    warnings = []
+    if profile.get("verification_status") == "verified" and unverified:
+        warnings.append("Profile is labelled verified, but individual turns remain unverified: " + ", ".join(unverified) + ".")
+    if unnamed:
+        warnings.append("Unnamed or draft turn labels remain: " + ", ".join(unnamed) + ".")
+    if overlaps:
+        warnings.append("Turn windows overlap and their deltas are not additive: " + ", ".join(f"{item['left']}/{item['right']} ({item['overlap_m']} m)" for item in overlaps) + ".")
+    ready = bool(turns) and profile.get("verification_status") == "verified" and not unverified and not unnamed and not overlaps
+    return {
+        "ready_for_corner_analysis": ready, "warnings": warnings, "overlaps": overlaps,
+        "unverified_turns": unverified, "unnamed_turns": unnamed,
+        "verification_dimensions": {
+            "track_identity": "verified" if isinstance(profile.get("track_id"), int) else "unknown",
+            "track_length": "measured_in_game" if isinstance(profile.get("measured_game_length_m"), (int, float)) else "unknown",
+            "turn_labels": "verified" if turns and not unnamed and not unverified else "unverified",
+            "corner_boundaries": "verified" if turns and not unverified and not overlaps else "unverified",
+            "apex_calibration": "verified" if turns and not unverified else "estimated_or_unverified",
+        },
+    }
 
 
 class CircuitProfileStore:
@@ -152,3 +189,23 @@ class CircuitProfileStore:
         temporary.write_text(json.dumps(result, indent=2), encoding="utf-8")
         temporary.replace(path)
         return result
+
+    def delete(self, profile_id: str) -> dict[str, Any]:
+        if profile_id == SILVERSTONE_SEED["id"]:
+            raise CircuitProfileError("The built-in Silverstone seed cannot be deleted")
+        path = self._path(profile_id)
+        if not path.exists():
+            raise CircuitProfileError("Unknown circuit profile")
+        trash = self.directory.parent / "trash" / "circuit_profiles"
+        trash.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        destination = trash / f"{path.stem}--deleted-{stamp}-{uuid4().hex[:8]}.json"
+        try:
+            path.replace(destination)
+        except OSError as error:
+            raise CircuitProfileError("Could not move the circuit profile to local trash") from error
+        return {
+            "deleted_profile_id": profile_id,
+            "recoverable": True,
+            "moved_to": str(destination.relative_to(self.directory.parent)),
+        }

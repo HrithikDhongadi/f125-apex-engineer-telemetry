@@ -60,12 +60,21 @@ class AnalysisTests(unittest.TestCase):
         profile = {
             "id": "test", "circuit_name": "Test", "verification_status": "verified",
             "measured_game_length_m": 300,
+            "centreline": [
+                {"distance_m": 300, "x": 3, "z": 4},
+                {"distance_m": 0, "x": 1, "z": 2},
+                {"distance_m": "bad", "x": 0, "z": 0},
+            ],
             "turns": [{"number": 1, "name": "Test turn", "entry_m": 0, "estimated_apex_m": 200, "exit_m": 300, "direction": "right", "verification_status": "verified"}],
         }
-        turn = compare_laps(baseline, candidate, profile)["engineer_notes"]["windows"][0]
+        comparison = compare_laps(baseline, candidate, profile)
+        turn = comparison["engineer_notes"]["windows"][0]
         self.assertEqual(turn["estimated_apex_m"], 200)
         self.assertIn("candidate_exit_speed_kph", turn["evidence"])
         self.assertTrue(any("estimated apex" in text for text in turn["statements"]))
+        self.assertEqual(comparison["circuit_map"]["profile"]["id"], "test")
+        self.assertEqual(comparison["circuit_map"]["centreline"][0]["distance_m"], 0)
+        self.assertEqual(comparison["circuit_map"]["turns"][0]["number"], 1)
 
 
 class SessionStoreTests(unittest.TestCase):
@@ -103,15 +112,26 @@ class SessionStoreTests(unittest.TestCase):
             self.assertEqual(latest["lap_distance_m"], 800.5)
             self.assertEqual(latest["current_lap_ms"], 12_345)
 
-    def test_incompatible_modes_and_tracks_are_rejected(self):
+    def test_race_time_trial_and_game_invalid_laps_compare_with_warnings(self):
         samples = [sample(0, 0), sample(5891, 90_000)]
         race = Lap(1, 90_000, False, samples=samples, saved_at="race", recording_session_id="race-1", mode="race", track_id=7)
-        trial = Lap(1, 89_000, False, samples=samples, saved_at="tt", recording_session_id="tt-1", mode="time_trial", track_id=7)
-        with self.assertRaisesRegex(ComparisonError, "Race and Time Trial"):
-            compare_laps(race, trial)
+        trial = Lap(1, 89_000, True, samples=samples, saved_at="tt", recording_session_id="tt-1", mode="time_trial", track_id=7)
+        comparison = compare_laps(race, trial)
+        self.assertEqual(comparison["summary"]["final_delta_s"], -1.0)
+        self.assertFalse(comparison["data_quality"]["like_for_like_mode"])
+        self.assertFalse(comparison["data_quality"]["both_game_valid"])
+        self.assertTrue(any("Race and Time Trial" in warning for warning in comparison["comparison_warnings"]))
+        self.assertTrue(any("Candidate is game-invalid" in warning for warning in comparison["comparison_warnings"]))
+
+    def test_different_tracks_and_partial_distance_capture_are_rejected(self):
+        samples = [sample(0, 0), sample(5891, 90_000)]
+        trial = Lap(1, 89_000, False, samples=samples, saved_at="tt", recording_session_id="tt-1", mode="time_trial", track_id=7, track_length_m=5891)
         other_track = Lap(1, 89_000, False, samples=samples, saved_at="other", recording_session_id="tt-2", mode="time_trial", track_id=8)
         with self.assertRaisesRegex(ComparisonError, "different tracks"):
             compare_laps(trial, other_track)
+        partial = Lap(2, 45_000, True, samples=[sample(2800, 0), sample(5890, 45_000)], saved_at="partial", recording_session_id="tt-2", mode="time_trial", track_id=7, track_length_m=5891)
+        with self.assertRaisesRegex(ComparisonError, "partial laps cannot be compared"):
+            compare_laps(trial, partial)
 
     def test_legacy_alignment_suppresses_corner_notes(self):
         old_samples = [{**sample(None, 0), "lap_distance_m": None}, {**sample(None, 90_000), "lap_distance_m": None}]

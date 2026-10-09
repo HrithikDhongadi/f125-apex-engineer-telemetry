@@ -13,9 +13,12 @@
         <div id="connection" class="status">Waiting for UDP</div>
       </header>
       <nav class="tabs" aria-label="Dashboard views">
-        <button class="active" data-view="live">Live</button>
-        <button data-view="analysis">Lap Analysis</button>
-        <button data-view="session">Session</button>
+        <button class="active" data-view="live" aria-keyshortcuts="1">Live</button>
+        <button data-view="analysis" aria-keyshortcuts="2">Lap Analysis</button>
+        <button data-view="session" aria-keyshortcuts="3">Session</button>
+        <button data-view="circuit-profiler" aria-keyshortcuts="4">Circuit Profiler</button>
+        <button data-view="settings" aria-keyshortcuts="5">Settings</button>
+        <span class="global-shortcuts">Keys 1–5: pages · Esc: cancel</span>
       </nav>
       <section class="panel recorder" aria-label="Recording session controls">
         <div class="recorder-status">
@@ -35,6 +38,14 @@
           <label for="session-select">Displayed session</label>
           <select id="session-select"></select>
           <span id="historical-badge" class="historical" hidden>Historical view · live telemetry remains current</span>
+        </div>
+        <div class="session-query" aria-label="Saved session date filter">
+          <div class="session-query-intro"><span class="eyebrow">Find saved sessions</span><p class="hint">Choose a year to reveal sessions, then optionally narrow by month and date.</p></div>
+          <label>Year<select id="session-filter-year"><option value="">Choose year</option></select></label>
+          <label>Month<select id="session-filter-month" disabled><option value="">All months</option></select></label>
+          <label>Date<select id="session-filter-day" disabled><option value="">All dates</option></select></label>
+          <button id="session-filter-clear" type="button">Clear</button>
+          <strong id="session-filter-count">No archive sessions shown</strong>
         </div>
       </section>
 
@@ -60,47 +71,39 @@
         <article class="panel compare-controls">
           <fieldset><legend>Baseline</legend><label for="baseline-session">Session or PB</label><select id="baseline-session"></select><label for="baseline">Lap</label><select id="baseline"></select></fieldset>
           <fieldset><legend>Candidate</legend><label for="candidate-session">Session or PB</label><select id="candidate-session"></select><label for="candidate">Lap</label><select id="candidate"></select></fieldset>
-          <button id="compare">Compare valid laps</button>
+          <div class="compare-actions"><button id="compare">Compare laps</button><button id="download-comparison-report" disabled>Download analysis report</button></div>
           <p id="compare-error" class="error" role="alert"></p>
+          <p id="compare-warning" class="comparison-warning"></p>
         </article>
         <div id="comparison" hidden>
           <div id="comparison-summary" class="summary-grid"></div>
+          <div id="comparison-warnings" class="comparison-warning" hidden></div>
           <p id="alignment-notice" class="notice"></p>
           <article class="panel chart-panel"><h2>Lap delta</h2><p class="hint">Candidate − baseline. Negative is faster.</p><div class="chart" data-chart="delta"></div></article>
           <article class="panel chart-panel"><h2>Speed</h2><div class="chart" data-chart="speed"></div></article>
-          <article id="line-overlay-panel" class="panel chart-panel" hidden><h2>Game-coordinate line overlay</h2><p class="hint">Motion X/Z; visual difference only, with no automatic handling diagnosis.</p><svg id="line-overlay" class="circuit-map" viewBox="0 0 800 360"></svg></article>
+          <article id="line-overlay-panel" class="panel pace-map-panel" hidden>
+            <div class="panel-heading"><div><h2>Where the lap time was won</h2><p id="pace-map-description" class="hint">Circuit-profile centreline coloured by local change in lap delta.</p></div><div id="pace-map-profile" class="profile-pill"></div></div>
+            <div class="pace-map-legend"><span><i class="candidate-gain"></i>Candidate gains</span><span><i class="baseline-gain"></i>Baseline gains</span><span><i class="pace-even"></i>Near even</span></div>
+            <div id="pace-map-canvas" class="pace-map" role="img" tabindex="0" aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight + - Q E 0" aria-label="Circuit map showing local lap-time gains"></div>
+            <div class="pace-map-help"><span>Drag anywhere / arrows: pan</span><span>Wheel / + −: zoom</span><span>Shift+wheel / Q E: rotate</span><div class="map-actions"><button id="pace-map-rotate-left" type="button" title="Rotate left (Q)">↶ Rotate</button><button id="pace-map-rotate-right" type="button" title="Rotate right (E)">Rotate ↷</button><button id="pace-map-reset" type="button" title="Reset map view (0)">Reset view</button></div></div>
+            <p class="hint pace-map-note">Colour shows the local change in cumulative delta around each section—not simply which lap is ahead overall. Turn labels and windows come from the selected circuit profile.</p>
+          </article>
           <article class="panel chart-panel"><h2>Throttle & brake</h2><div class="chart" data-chart="pedals"></div></article>
           <article id="motion-ex-panel" class="panel chart-panel" hidden><h2>Motion Ex</h2><p class="hint">Front-wheel angle and chassis yaw are measured channels. Slip traces are wheel-pair aggregates; no handling diagnosis is inferred automatically.</p><div class="chart" data-chart="motion-ex"></div></article>
           <article id="wheel-slip-panel" class="panel chart-panel" hidden><h2>Wheel slip ratio</h2><p class="hint">Absolute front/rear wheel-pair averages from Motion Ex.</p><div class="chart" data-chart="wheel-slip"></div></article>
           <article id="slip-angle-panel" class="panel chart-panel" hidden><h2>Wheel slip angle</h2><p class="hint">Absolute front/rear wheel-pair averages from Motion Ex, in radians. This view does not assert an understeer/oversteer diagnosis.</p><div class="chart" data-chart="slip-angle"></div></article>
           <article class="panel"><div class="panel-heading"><h2>Engineer Notes</h2><span class="hint">Trace evidence only</span></div><p id="calibration" class="notice"></p><div id="engineer-notes" class="notes-grid"></div></article>
         </div>
-        <article id="analysis-empty" class="panel empty-state">Select two valid laps. The candidate delta is measured against the baseline.</article>
+        <article id="analysis-empty" class="panel empty-state">Select two laps from the same circuit. Invalid and Race/Time Trial comparisons are allowed for exploratory analysis and are clearly warned.</article>
       </section>
 
       <section id="view-session" class="view">
         <article class="panel session-library">
-          <div class="panel-heading"><div><h2>Session library</h2><p class="hint">Select a session to inspect it. Legacy captures are read-only.</p></div></div>
+          <div class="panel-heading"><div><h2>Session library</h2><p class="hint">Use the date query above to reveal saved sessions. Legacy captures are read-only; deleted sessions are moved to recoverable local trash.</p></div></div>
           <div id="session-cards" class="session-cards"></div>
-          <div class="rename-row"><input id="rename-session" maxlength="80" placeholder="Rename selected session"><button id="rename-button">Rename</button></div>
+          <div class="rename-row"><input id="rename-session" maxlength="80" placeholder="Rename selected session"><button id="rename-button">Rename</button><button id="delete-session" class="danger">Delete session</button></div>
           <div id="track-override-row" class="rename-row" hidden><input id="track-override" maxlength="80" placeholder="Display name for unknown track"><button id="track-override-button">Set circuit display name</button><span class="hint">The numeric track ID remains the PB/comparison identity.</span></div>
-        </article>
-        <article class="panel profile-editor">
-          <div class="panel-heading"><div><h2>Circuit profile</h2><p class="hint">Inspect a clean Motion X/Z trace, edit game-distance turn boundaries, then verify them manually. Approximate seeds remain labelled.</p></div></div>
-          <div class="profile-controls">
-            <label>Selected profile <select id="profile-select"></select></label>
-            <button id="profile-apply">Use for this session</button>
-            <button id="profile-alternate">Create alternate</button>
-            <label>Verification <select id="profile-verification"><option value="unverified">Unverified</option><option value="approximate">Approximate</option><option value="verified">Manually verified</option></select></label>
-            <label>Source/provenance <input id="profile-source" maxlength="200" placeholder="e.g. clean F1 25 60 Hz lap"></label>
-            <label>Calibration lap <select id="profile-lap"></select></label>
-            <button id="profile-load-trace">Load distance map</button>
-            <button id="profile-add-suggestions" disabled>Add turn suggestions</button>
-          </div>
-          <p id="profile-message" class="notice"></p>
-          <svg id="circuit-map" class="circuit-map" viewBox="0 0 800 360" role="img" aria-label="Recorded game-coordinate circuit trace"></svg>
-          <div id="profile-turns" class="profile-turns"></div>
-          <div class="profile-controls"><button id="profile-add-turn">Add turn</button><button id="profile-save" class="primary">Save profile</button></div>
+          <div class="session-profile-row"><div><span class="eyebrow">Circuit profile</span><strong id="session-profile-name">None selected</strong><span id="session-profile-status" class="hint">Open Circuit Profiler to create or select one.</span></div><button id="edit-session-profile" type="button">Open Circuit Profiler</button></div>
         </article>
         <article class="panel table-panel">
           <div class="panel-heading"><div><h2>Recorded laps</h2><p class="hint">Sorted fastest first; invalid laps can be included in reports.</p></div><span id="lap-count"></span></div>
@@ -108,6 +111,7 @@
             <div><button id="select-all-laps">Select all</button><button id="clear-laps">Clear</button></div>
             <label><input type="radio" name="export-scope" value="selected" checked> Selected laps</label>
             <label><input type="radio" name="export-scope" value="session"> Whole session</label>
+            <label>Report <select id="report-type"><option value="auto">Automatic for session</option><option value="lap_analysis">Lap analysis</option><option value="race">Race engineer</option><option value="time_trial">Time Trial engineer</option></select></label>
             <strong id="export-count">0 laps</strong>
             <button id="download-report">Download Markdown</button><button id="download-zip">Download full data ZIP</button>
             <span id="export-error" class="error"></span>
@@ -115,8 +119,85 @@
           <div class="table-scroll"><table><thead><tr><th>Export</th><th>Lap</th><th>Time</th><th>Sectors 1 / 2</th><th>Setup</th><th>Samples</th><th>Peak / min</th><th>Note or tag</th><th>Actions</th></tr></thead><tbody id="session-laps"></tbody></table></div>
         </article>
         <article class="panel">
-          <div class="panel-heading"><div><h2>Race event timeline</h2><p class="hint">UDP events are direct game messages; state transitions are explicitly labelled inferred.</p></div></div>
+          <div class="panel-heading"><div><h2>Race event timeline</h2><p class="hint">Accepted final-timeline events are shown by default. Raw events from abandoned flashback branches remain stored and can be revealed for audit.</p></div><div><label class="timeline-filter"><input id="timeline-superseded-events" type="checkbox"> Show superseded branches</label> <label class="timeline-filter"><input id="timeline-other-car-events" type="checkbox"> Show other cars</label> <label class="timeline-filter"><input id="timeline-controller-events" type="checkbox"> Show controller inputs</label></div></div>
           <div id="race-timeline" class="race-timeline"><p class="empty">No continuous timeline for this session.</p></div>
+        </article>
+      </section>
+
+      <section id="view-circuit-profiler" class="view">
+        <article class="panel profile-editor">
+          <div class="panel-heading"><div><h2>Circuit Profiler</h2><p class="hint">Uses the displayed session selected above. Load a clean Motion X/Z lap, point turn apexes, and verify the resulting circuit profile.</p></div></div>
+          <div class="profiler-toolbar">
+            <section class="profiler-control-group">
+              <h3>Profile</h3>
+              <div class="profile-controls">
+                <label>Selected profile <select id="profile-select"></select></label>
+                <button id="profile-load-saved">Load profile</button>
+                <button id="profile-apply">Use for this session</button>
+                <button id="profile-alternate">Create alternate</button>
+                <button id="profile-delete" class="danger">Delete profile</button>
+                <label>Verification <select id="profile-verification"><option value="unverified">Unverified</option><option value="approximate">Approximate</option><option value="verified">Manually verified</option></select></label>
+              </div>
+            </section>
+            <section class="profiler-control-group">
+              <h3>Calibration trace</h3>
+              <div class="profile-controls">
+                <label>Calibration lap <select id="profile-lap"></select></label>
+                <button id="profile-load-trace" class="primary">Load distance map</button>
+                <button id="profile-add-suggestions" disabled>Add suggestions</button>
+                <label class="profile-source-field">Source/provenance <input id="profile-source" maxlength="200" placeholder="e.g. clean F1 25 60 Hz lap"></label>
+              </div>
+            </section>
+          </div>
+          <p id="profile-message" class="notice"></p>
+          <div id="circuit-map" class="circuit-editor" role="img" tabindex="0" aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight + - Q E 0" aria-label="Interactive recorded game-coordinate circuit trace"></div>
+          <div class="circuit-editor-help"><span>Drag anywhere / arrows: pan</span><span>Wheel / + −: zoom</span><span>Shift+wheel / Q E: rotate</span><span>Click turn: show margins</span><span>Drag marker: move apex</span><div class="map-actions"><label>Turn display <select id="profile-turn-display"><option value="minimal">Minimal</option><option value="dots">Apex dots</option><option value="ranges">Colored turn ranges</option></select></label><button id="profile-rotate-left" type="button" title="Rotate left (Q)">↶ Rotate</button><button id="profile-rotate-right" type="button" title="Rotate right (E)">Rotate ↷</button><button id="profile-reset-view" type="button" title="Reset map view (0)">Reset view</button></div></div>
+          <div class="turn-pointer">
+            <label>Turn number <input id="point-turn-number" maxlength="20" placeholder="e.g. 4"></label>
+            <label>Turn name <input id="point-turn-name" maxlength="80" placeholder="optional"></label>
+            <label>Margin each side <span class="input-with-unit"><input id="point-turn-margin" type="number" min="10" max="1000" step="5" value="60"><span>m</span></span></label>
+            <button id="profile-point-turn" type="button" disabled>Point apex on map</button>
+            <button id="profile-cancel-point" type="button" disabled>Cancel</button>
+            <span id="point-turn-status" class="hint">Load a clean distance map first.</span>
+          </div>
+          <div class="turn-list-toolbar"><div><h3>Turn details</h3><p id="turn-list-status" class="hint">Select a turn marker to edit it.</p></div><button id="profile-show-all-turns" type="button">Show all turns</button></div>
+          <div id="profile-turns" class="profile-turns"></div>
+          <div class="profile-actions"><button id="profile-add-turn">Add turn manually</button><button id="profile-save" class="primary">Save profile</button></div>
+        </article>
+      </section>
+
+      <section id="view-settings" class="view">
+        <article class="panel">
+          <div class="panel-heading"><div><h2>F1 25 telemetry setup</h2><p class="hint">Enter these values in F1 25 → Settings → Telemetry Settings.</p></div><span class="profile-pill">UDP format 2025</span></div>
+          <div class="settings-help-grid">
+            <div><span>UDP Telemetry</span><strong>On</strong></div>
+            <div><span>UDP Send Rate</span><strong>60 Hz</strong></div>
+            <div><span>UDP Format</span><strong>2025</strong></div>
+            <div><span>UDP Port</span><strong id="telemetry-help-port">20777</strong></div>
+            <div><span>UDP Broadcast Mode</span><strong>Off for direct IP</strong></div>
+            <div><span>Your Telemetry</span><strong>Restricted is sufficient</strong></div>
+          </div>
+          <div class="telemetry-addresses"><h3>UDP IP address</h3><p>Same computer: <code>127.0.0.1</code></p><p>Console or another computer: use this receiver computer's LAN address:</p><div id="receiver-ip-list" class="setup"></div><p class="hint">The game device and this computer must be on the same network. Allow inbound UDP on the configured port in the operating-system firewall.</p></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><div><h2>Dashboard settings</h2><p class="hint">Listening address and port changes are saved immediately but apply after restarting the server.</p></div></div>
+          <form id="settings-form" class="settings-form">
+            <label>Dashboard access<select id="setting-web-host"><option value="127.0.0.1">This computer only</option><option value="0.0.0.0">This computer and local network</option></select></label>
+            <label>Dashboard HTTP port<input id="setting-web-port" type="number" min="1024" max="65535"></label>
+            <label>F1 UDP listening port<input id="setting-udp-port" type="number" min="1024" max="65535"></label>
+            <label>Deleted-session retention<input id="setting-trash-days" type="number" min="0" max="3650"><small>days; 0 keeps deleted sessions until manually restored</small></label>
+            <label>Maximum continuous recording<input id="setting-max-recording" type="number" min="0.25" max="64" step="0.25"><small>GB per new recording</small></label>
+            <label>Diagnostic segment limit<input id="setting-diagnostic-mb" type="number" min="1" max="1024"><small>MB per diagnostic file</small></label>
+            <label>Library refresh interval<input id="setting-refresh-seconds" type="number" min="2" max="60"><small>seconds</small></label>
+            <div class="settings-actions"><button class="primary" type="submit">Save settings</button></div>
+          </form>
+          <p id="settings-message" class="notice"></p>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading"><div><h2>Deleted sessions</h2><p class="hint">Restore before the displayed purge time. Expired entries are permanently removed when the server starts or retention is changed.</p></div></div>
+          <div id="deleted-session-list" class="deleted-session-list"><p class="empty">No deleted sessions.</p></div>
         </article>
       </section>
     </main>
@@ -129,6 +210,7 @@
       </form>
     </dialog>
     <div id="tooltip" class="tooltip" hidden></div>
+    <script src="circuit-profiler.bundle.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

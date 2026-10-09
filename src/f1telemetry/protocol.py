@@ -343,6 +343,8 @@ def decode_event(data: bytes, header: PacketHeader) -> dict[str, Any] | None:
         result.update({"vehicle_1_index": data[offset], "vehicle_2_index": data[offset + 1]})
     elif code == "DRSD" and len(data) > offset:
         result["reason"] = data[offset]
+    elif code == "BUTN" and len(data) >= offset + 4:
+        result["button_status"] = struct.unpack_from("<I", data, offset)[0]
     return result
 
 

@@ -2,7 +2,7 @@ import struct
 import unittest
 
 from src.f1telemetry.protocol import (
-    HEADER_SIZE, decode_car_damage, decode_car_status, decode_header, decode_packet,
+    HEADER_SIZE, decode_car_damage, decode_car_status, decode_event, decode_header, decode_packet,
     decode_lap_positions, decode_motion, supported_header,
 )
 
@@ -12,6 +12,12 @@ def header(packet_id: int, frame: int = 10, version: int = 1) -> bytes:
 
 
 class ExtendedProtocolTests(unittest.TestCase):
+    def test_button_event_decodes_controller_status_bitmask(self):
+        packet = header(3) + b"BUTN" + struct.pack("<I", 0x00200401)
+        decoded = decode_event(packet, decode_header(packet))
+        self.assertEqual(decoded["code"], "BUTN")
+        self.assertEqual(decoded["button_status"], 0x00200401)
+
     def test_motion_offsets_and_length(self):
         body = bytearray(60 * 22)
         struct.pack_into("<6f6h6f", body, 0, 1.25, 2.5, -3.75, 4, 5, 6, 32767, 0, -32767, 0, 0, 0, 1.1, -0.5, 0.2, 2.2, 0.3, -0.4)

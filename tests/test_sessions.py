@@ -13,9 +13,12 @@ from src.f1telemetry.receiver import LEGACY_SESSION_ID, Lap, SessionStore, UdpRe
 UID = 1001
 
 
-def game(uid=UID, mode="time_trial", track_id=7, track_length=5891):
+def game(uid=UID, mode="time_trial", track_id=7, track_length=5891, session_type=None, session_name=None):
+    default_type = {"practice": 1, "qualifying": 5, "race": 15, "time_trial": 18}.get(mode, 0)
+    resolved_type = default_type if session_type is None else session_type
     return {
-        "session_uid": uid, "session_type": 18 if mode == "time_trial" else 15,
+        "session_uid": uid, "session_type": resolved_type,
+        "session_type_name": session_name or {1: "Practice 1", 5: "Qualifying 1", 9: "One-Shot Qualifying", 15: "Race", 18: "Time Trial"}.get(resolved_type, mode),
         "mode": mode, "track_id": track_id, "track_length_m": track_length,
     }
 
@@ -46,6 +49,52 @@ def fill_lap(store, uid, number, time_ms=90_000):
 
 
 class RecordingSessionTests(unittest.TestCase):
+    def test_live_snapshot_is_small_and_all_laps_can_be_hydrated_once(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(1), UID)
+            run = store.start_time_trial_run("cache hydration")
+            fill_lap(store, UID, 1)
+            self.assertNotIn("laps", store.live_snapshot())
+            self.assertIn("laps", store.snapshot())
+            self.assertEqual([lap["recording_session_id"] for lap in store.list_all_laps()], [run["id"]])
+
+    def test_practice_auto_records_complete_flying_laps_but_not_the_outlap(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="practice"))
+            session_id = store.active_recording_id
+            self.assertIsNotNone(session_id)
+            self.assertEqual(store.sessions[session_id].mode, "practice")
+            self.assertEqual(store.sessions[session_id].game_session_name, "Practice 1")
+            store.record_lap_state(lap_state(1, 40_000, 3_000), UID)
+            store.record_lap_state(lap_state(2, 0, 0, 95_000), UID)
+            fill_lap(store, UID, 2)
+            self.assertEqual([lap.number for lap in store.session_laps[session_id]], [2])
+
+    def test_one_shot_qualifying_records_its_first_timed_lap(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="qualifying", session_type=9, session_name="One-Shot Qualifying"))
+            session_id = store.active_recording_id
+            store.record_lap_state(lap_state(1), UID, {"session_time": 1.0})
+            fill_lap(store, UID, 1)
+            self.assertEqual([lap.number for lap in store.session_laps[session_id]], [1])
+            self.assertEqual(store.session_laps[session_id][0].mode, "qualifying")
+
+    def test_qualifying_phase_change_under_same_uid_creates_a_new_session(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="qualifying", session_type=5, session_name="Qualifying 1"))
+            first_id = store.active_recording_id
+            store.record_game_session(game(mode="qualifying", session_type=6, session_name="Qualifying 2"))
+            second_id = store.active_recording_id
+            self.assertNotEqual(first_id, second_id)
+            self.assertEqual(store.sessions[first_id].status, "completed")
+            self.assertEqual(store.sessions[second_id].game_session_type, 6)
+            self.assertEqual(store.sessions[second_id].name, "Qualifying 2 · Silverstone")
+
     def test_lap_summary_exposes_compact_circuit_statistics_context(self):
         lap = Lap(
             4, 90_000, False, saved_at="context", mode="race", track_id=10,

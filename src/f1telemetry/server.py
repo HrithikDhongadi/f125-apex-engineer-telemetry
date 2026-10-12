@@ -51,22 +51,41 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC), **kwargs)
 
+    def end_headers(self) -> None:
+        # Revalidate dashboard assets so local upgrades do not leave an old
+        # app.js or stylesheet paired with a newer server API.
+        if not urlparse(self.path).path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
     def log_message(self, format: str, *args) -> None:
-        LOGGER.info("%s %s", self.address_string(), format % args)
+        # A healthy dashboard polls this deliberately small endpoint once per
+        # second. Keeping successful polls out of INFO makes the server log an
+        # operational record instead of a wall of heartbeat requests.
+        message = format % args
+        if self.path == "/api/live" and ' 200 ' in f" {message} ":
+            LOGGER.debug("%s %s", self.address_string(), message)
+        else:
+            LOGGER.info("%s %s", self.address_string(), message)
 
     def do_GET(self) -> None:  # noqa: N802
         request = urlparse(self.path)
         path = request.path
+        if path == "/api/live":
+            return self._json(self.store.live_snapshot())
         if path == "/api/snapshot":
             return self._json(self.store.snapshot())
         if path == "/api/laps":
-            session_id = parse_qs(request.query).get("session", [None])[0]
+            query = parse_qs(request.query)
+            if query.get("all", [""])[0] == "1":
+                return self._json({"laps": self.store.list_all_laps()})
+            session_id = query.get("session", [None])[0]
             try:
                 return self._json({"laps": self.store.list_laps(session_id)})
             except SessionStateError as error:
                 return self._json({"error": str(error)}, 404)
         if path == "/api/sessions":
-            return self._json({"sessions": self.store.list_sessions(), **self.store.snapshot()})
+            return self._json({"sessions": self.store.list_sessions(), **self.store.live_snapshot()})
         if path == "/api/personal-bests":
             return self._json({"personal_bests": self.store.list_personal_bests()})
         if path == "/api/setup-schema":

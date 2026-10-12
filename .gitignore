@@ -1,5 +1,11 @@
 __pycache__/
 *.py[cod]
-data*
+data/
 node_modules/
-logs*
+logs/
+.venv/
+.coverage
+htmlcov/
+.pytest_cache/
+.DS_Store
+npm-debug.log*

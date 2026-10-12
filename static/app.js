@@ -2,16 +2,22 @@ const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtTime = (ms) => ms == null ? "—" : `${Math.floor(ms / 60000)}:${String(((ms % 60000) / 1000).toFixed(3)).padStart(6, "0")}`;
 const fmtSetup = (s) => s ? `${s.front_wing??"unknown"}/${s.rear_wing??"unknown"} wings · ${s.on_throttle_diff??"unknown"}/${s.off_throttle_diff??"unknown"}% diff · ${setupFields.filter(f=>s[f.key]!==undefined).length}/${setupFields.length} fields` : "unknown";
-const colors = {green:"#65e6ad",orange:"#ffad5a",blue:"#65b8ff",red:"#ff7379",yellow:"#ffd166"};
+const colors = {baseline:"#43c6e8",candidate:"#e10600",baselineAlt:"#45a7ff",candidateAlt:"#ff6b55",delta:"#ffb020"};
 let sessions = [], laps = [], allLaps = [], personalBests = [], setupFields = [], circuitProfiles = [], circuitTrace = [], suggestedTurns = [], raceTimeline = [], selectedLapIds = new Set(), selectedSessionId = null, activeRecording = null, latestState = {}, diagnosticState = {}, comparison = null, editingLap = null;
 const lapsBySession = new Map();
+const timelineBySession = new Map();
+const timelineRequests = new Map();
 let circuitEditor = null, paceMapCanvas = null, paceMapSource = null, pointedTurn = null, selectedTurnIndex = null, profileEditorDirty = false, profileEditorSessionId = null;
 let showAllTurnCards = false;
 let turnDisplayMode = "minimal";
 let sessionFilter = {year:"", month:"", day:""};
-let circuitStatsPage = 1;
+let circuitStatsPage = 1, raceStatsPage = 1, sessionPage = 1, sessionLapsPage = 1, pbPage = 1, deletedPage = 1, timelinePage = 1;
 const CIRCUIT_STATS_PAGE_SIZE = 10;
+const DASHBOARD_PAGE_SIZE = 10;
+const TIMELINE_PAGE_SIZE = 25;
 let dashboardSettings = {}, deletedSessions = [], receiverIps = [], libraryTimer = null, libraryRefreshSeconds = 8;
+let libraryInitialized = false, libraryRequestPending = false, libraryReloadRequested = false, liveRequestPending = false;
+let syncedSelectedSessionId = null, sessionFormSessionId = null, renameDraftDirty = false, trackDraftDirty = false, settingsDraftDirty = false, recorderFeedbackUntil = 0;
 try { turnDisplayMode = localStorage.getItem("circuit-profiler-turn-display") || "minimal"; } catch (_) {}
 if (!["minimal","dots","ranges"].includes(turnDisplayMode)) turnDisplayMode = "minimal";
 
@@ -23,11 +29,16 @@ async function request(url, options) {
 }
 async function post(url, payload={}) { return request(url, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}); }
 
+function pageData(items,page,size=DASHBOARD_PAGE_SIZE){const pages=Math.max(1,Math.ceil(items.length/size)),current=Math.min(Math.max(1,page),pages),start=(current-1)*size;return{current,pages,start,items:items.slice(start,start+size)};}
+function updatePager(previousId,labelId,nextId,page,pages,total,noun="items"){$(previousId).disabled=page<=1;$(nextId).disabled=page>=pages;$(labelId).textContent=`Page ${page} of ${pages} · ${total} ${noun}`;}
+
 function activateView(button) {
+  document.body.dataset.view=button.dataset.view;
   document.querySelectorAll(".tabs button").forEach(item => item.classList.toggle("active", item === button));
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === `view-${button.dataset.view}`));
   if (button.dataset.view === "analysis" && comparison) requestAnimationFrame(() => drawCharts(comparison));
   if (button.dataset.view === "circuit-stats") renderCircuitStats();
+  if (button.dataset.view === "session") void ensureSelectedTimeline();
   if (button.dataset.view === "circuit-profiler") requestAnimationFrame(renderCircuitMap);
 }
 document.querySelectorAll(".tabs button").forEach(button => button.addEventListener("click", () => activateView(button)));
@@ -49,7 +60,7 @@ function chips(target, values) {
 }
 function renderSettings(){
   if(!dashboardSettings.web_port)return;
-  if(!$("settings-form").contains(document.activeElement)){
+  if(!settingsDraftDirty){
     $("setting-web-host").value=dashboardSettings.web_host;
     $("setting-web-port").value=dashboardSettings.web_port;
     $("setting-udp-port").value=dashboardSettings.udp_port;
@@ -60,7 +71,9 @@ function renderSettings(){
   }
   $("telemetry-help-port").textContent=dashboardSettings.udp_port;
   $("receiver-ip-list").innerHTML=receiverIps.map(ip=>`<span class="chip"><b>${esc(ip)}</b>${ip.startsWith("127.")?" · same computer":" · LAN"}</span>`).join("");
-  $("deleted-session-list").innerHTML=deletedSessions.length?deletedSessions.map(item=>`<article class="deleted-session"><div><strong>${esc(item.name)}</strong><span>${esc(item.mode.replaceAll("_"," "))} · track ID ${item.track_id??"unknown"} · ${item.lap_count} laps</span><span>Deleted ${new Date(item.deleted_at).toLocaleString()} · ${item.purge_at?`permanent deletion ${new Date(item.purge_at).toLocaleString()}`:"kept until restored"}</span></div><button type="button" data-restore="${esc(item.trash_id)}">Restore</button></article>`).join(""):'<p class="empty">No deleted sessions.</p>';
+  const deletedPagination=pageData(deletedSessions,deletedPage);deletedPage=deletedPagination.current;
+  $("deleted-session-list").innerHTML=deletedSessions.length?deletedPagination.items.map(item=>`<article class="deleted-session"><div><strong>${esc(item.name)}</strong><span>${esc(item.mode.replaceAll("_"," "))} · track ID ${item.track_id??"unknown"} · ${item.lap_count} laps</span><span>Deleted ${new Date(item.deleted_at).toLocaleString()} · ${item.purge_at?`permanent deletion ${new Date(item.purge_at).toLocaleString()}`:"kept until restored"}</span></div><button type="button" data-restore="${esc(item.trash_id)}">Restore</button></article>`).join(""):'<p class="empty">No deleted sessions.</p>';
+  updatePager("deleted-prev","deleted-pagination-label","deleted-next",deletedPage,deletedPagination.pages,deletedSessions.length,"deleted sessions");
   document.querySelectorAll("[data-restore]").forEach(button=>button.addEventListener("click",()=>restoreDeletedSession(button.dataset.restore)));
 }
 async function restoreDeletedSession(trashId){
@@ -72,8 +85,9 @@ function scheduleLibraryRefresh(){
   const seconds=Number(dashboardSettings.dashboard_refresh_seconds)||8;
   if(libraryTimer&&seconds===libraryRefreshSeconds)return;
   if(libraryTimer)clearInterval(libraryTimer);
-  libraryRefreshSeconds=seconds;libraryTimer=setInterval(loadLibrary,seconds*1000);
+  libraryRefreshSeconds=seconds;libraryTimer=setInterval(()=>loadLibrary({background:true}),seconds*1000);
 }
+function setRecorderFeedback(message){recorderFeedbackUntil=Date.now()+8000;$('recording-message').textContent=message;}
 function renderLive(latest) {
   latestState = latest;
   $("connection").textContent = latest.receiver_error ? `UDP packet error · ${latest.receiver_error}` : latest.connected ? "UDP connected" : "Waiting for UDP";
@@ -96,26 +110,27 @@ function renderRecorder() {
   const badge=$("recording-badge");
   badge.className=`recording-badge ${recording?.status==="armed"?"armed":recording?"active":""}`;
   badge.textContent=recording?(recording.status==="armed"?"Armed":recording.capturing_lap_number!=null?`Recording lap ${recording.capturing_lap_number}`:"Recording"):"Not recording";
-  $("recording-name").textContent=recording?.name||(mode==="race"?"Race recorder ready":mode==="time_trial"?"Time Trial · start a run":"Waiting for game session");
-  $("game-context").textContent=`${mode.replace("_"," ")} · ${track}${latestState.game_session_uid?` · game UID ${latestState.game_session_uid}`:""}`;
-  $("recording-message").textContent=recording?.status==="armed"
+  const sessionTypeName=latestState.session_type_name||mode.replaceAll("_"," ");
+  $("recording-name").textContent=recording?.name||(mode==="time_trial"?"Time Trial · start a run":["practice","qualifying","race"].includes(mode)?`${sessionTypeName} recorder ready`:"Waiting for game session");
+  $("game-context").textContent=`${sessionTypeName} · ${track}${latestState.game_session_uid?` · game UID ${latestState.game_session_uid}`:""}`;
+  const statusMessage=recording?.status==="armed"
     ? "Armed — waiting for the next start/finish crossing; the partial approach is excluded."
     : recording?.capturing_lap_number!=null
       ? `Capturing lap ${recording.capturing_lap_number}; it will be saved at the next verified start/finish crossing.`
       : recording
         ? "Recording active — waiting for the next complete-lap start/finish crossing."
         : "";
+  if(Date.now()>=recorderFeedbackUntil) $("recording-message").textContent=statusMessage;
   $("run-name").hidden=mode!=="time_trial"||Boolean(recording);
   $("start-run").hidden=mode!=="time_trial"||Boolean(recording);
   $("stop-recording").hidden=!recording;
   $("jump-active").hidden=!recording||recording.id===selectedSessionId;
-  $("historical-badge").hidden=Boolean(recording&&recording.id===selectedSessionId);
+  document.querySelectorAll("[data-historical-badge]").forEach(badge=>{badge.hidden=Boolean(recording&&recording.id===selectedSessionId);});
   $("diagnostic-enabled").checked=Boolean(diagnosticState.enabled);
   $("diagnostic-status").textContent=diagnosticState.enabled
     ? `Diagnostics on${diagnosticState.active_file?` · ${diagnosticState.active_file} · ${diagnosticState.events} events`:" · the next recording will create a bounded trace"}${diagnosticState.truncated?" · size limit reached":""}.`
     : "Diagnostics are off. Enable before starting the short test run.";
-  if(!recording) $("historical-badge").textContent="Historical/closed session · live telemetry remains current";
-  else $("historical-badge").textContent="Historical view · live telemetry remains current";
+  document.querySelectorAll("[data-historical-badge]").forEach(badge=>{badge.textContent=!recording?"Historical/closed session · live telemetry remains current":"Historical view · live telemetry remains current";});
 }
 function sessionLabel(session){return `${session.name} · ${session.mode.replace("_"," ")} · ${session.track_name} · ${session.lap_count} laps`;}
 function sessionDateParts(session){
@@ -200,6 +215,7 @@ function raceStats(){
 }
 function renderRaceStats(){
   const races=raceStats(),allRaceLaps=races.flatMap(race=>race.laps),valid=allRaceLaps.filter(lap=>!lap.invalid),times=valid.map(lap=>lap.time_ms),classified=races.filter(race=>Number.isFinite(race.finish_position)),finishes=classified.map(race=>race.finish_position),wins=finishes.filter(position=>position===1).length,officialCount=classified.filter(race=>race.result_source==="official").length,fuel=races.map(race=>race.fuel_used).filter(Number.isFinite),pitStops=races.reduce((sum,race)=>sum+race.pit_stops,0),penalties=races.reduce((sum,race)=>sum+race.penalties_s,0),warnings=races.reduce((sum,race)=>sum+race.warnings,0);
+  const racePagination=pageData(races,raceStatsPage);raceStatsPage=racePagination.current;
   const cards=[
     ["Races recorded",races.length,`${finishes.length} classified · ${officialCount} official packet${officialCount===1?"":"s"}`],
     ["Race laps",allRaceLaps.length,allRaceLaps.length?`${(valid.length/allRaceLaps.length*100).toFixed(1)}% valid`:"No captured laps"],
@@ -213,7 +229,8 @@ function renderRaceStats(){
   ];
   $("race-stats-count").textContent=`${races.length} race${races.length===1?"":"s"} · ${finishes.length} classified`;
   $("race-stats-summary").innerHTML=cards.map(([label,value,detail])=>`<article><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(detail)}</small></article>`).join("");
-  $("race-stats-sessions").innerHTML=races.map(race=>{const finish=Number.isFinite(race.finish_position)?`P${race.finish_position}${Number.isFinite(race.grid)?` · grid P${race.grid}${Number.isFinite(race.positions_gained)?` · ${race.positions_gained>=0?"+":""}${race.positions_gained}`:""}`:""} · ${race.result_source==="official"?"official":"finish-line verified"}`:"Unknown — incomplete result evidence",date=race.session?.started_at?new Date(race.session.started_at).toLocaleDateString():"Unknown date";return `<tr><td><strong>${esc(race.session?.name||race.session_id)}</strong><br><span class="hint">${esc(date)}</span></td><td>${race.laps.length}<br><span class="hint">${race.valid.length} valid</span></td><td>${fmtTime(race.best)} / ${fmtTime(race.average)}</td><td>${race.deviation==null?"—":`±${(race.deviation/1000).toFixed(3)} s`}</td><td>${esc(finish)}</td><td>${race.pit_stops}</td><td>${race.penalties_s} s / ${race.warnings}</td><td>${race.fuel_used==null?"—":`${race.fuel_used.toFixed(2)} kg`}</td><td>${race.wear_increase==null?"—":`+${race.wear_increase.toFixed(1)} pp avg`}</td><td>${race.compounds.length?race.compounds.map(tyreCompoundLabel).join(", "):"Unknown"}</td><td><button class="race-stats-open" data-session="${esc(race.session_id)}">View session</button></td></tr>`;}).join("")||'<tr><td colspan="11" class="empty-state">No captured race laps match this circuit, year, session and search.</td></tr>';
+  $("race-stats-sessions").innerHTML=racePagination.items.map(race=>{const finish=Number.isFinite(race.finish_position)?`P${race.finish_position}${Number.isFinite(race.grid)?` · grid P${race.grid}${Number.isFinite(race.positions_gained)?` · ${race.positions_gained>=0?"+":""}${race.positions_gained}`:""}`:""} · ${race.result_source==="official"?"official":"finish-line verified"}`:"Unknown — incomplete result evidence",date=race.session?.started_at?new Date(race.session.started_at).toLocaleDateString():"Unknown date";return `<tr><td><strong>${esc(race.session?.name||race.session_id)}</strong><br><span class="hint">${esc(date)}</span></td><td>${race.laps.length}<br><span class="hint">${race.valid.length} valid</span></td><td>${fmtTime(race.best)} / ${fmtTime(race.average)}</td><td>${race.deviation==null?"—":`±${(race.deviation/1000).toFixed(3)} s`}</td><td>${esc(finish)}</td><td>${race.pit_stops}</td><td>${race.penalties_s} s / ${race.warnings}</td><td>${race.fuel_used==null?"—":`${race.fuel_used.toFixed(2)} kg`}</td><td>${race.wear_increase==null?"—":`+${race.wear_increase.toFixed(1)} pp avg`}</td><td>${race.compounds.length?race.compounds.map(tyreCompoundLabel).join(", "):"Unknown"}</td><td><button class="race-stats-open" data-session="${esc(race.session_id)}">View session</button></td></tr>`;}).join("")||'<tr><td colspan="11" class="empty-state">No captured race laps match this circuit, year, session and search.</td></tr>';
+  updatePager("race-stats-prev","race-stats-pagination-label","race-stats-next",raceStatsPage,racePagination.pages,races.length,"races");
   document.querySelectorAll(".race-stats-open").forEach(button=>button.addEventListener("click",async()=>{await selectSession(button.dataset.session);document.querySelector('[data-view="session"]').click();}));
 }
 async function openCircuitStatsLap(lapId,action){
@@ -239,7 +256,7 @@ function filteredSessions(){
   return sessions.filter(session=>{
     const date=sessionDateParts(session);
     return date.year===sessionFilter.year&&(!sessionFilter.month||date.month===sessionFilter.month)&&(!sessionFilter.day||date.day===sessionFilter.day);
-  });
+  }).sort((a,b)=>Date.parse(b.started_at||0)-Date.parse(a.started_at||0));
 }
 function sessionChoices(){
   const selected=sessions.find(session=>session.id===selectedSessionId),matches=filteredSessions();
@@ -248,49 +265,51 @@ function sessionChoices(){
 function renderSessionQuery(){
   const years=[...new Set(sessions.map(session=>sessionDateParts(session).year))].sort((a,b)=>a==="legacy"?1:b==="legacy"?-1:Number(b)-Number(a));
   if(sessionFilter.year&&!years.includes(sessionFilter.year))sessionFilter={year:"",month:"",day:""};
-  $("session-filter-year").innerHTML='<option value="">Choose year</option>'+years.map(year=>`<option value="${esc(year)}">${year==="legacy"?"Legacy / no date":esc(year)}</option>`).join("");
-  $("session-filter-year").value=sessionFilter.year;
-
   const matchingYear=sessions.filter(session=>sessionDateParts(session).year===sessionFilter.year);
   const months=[...new Set(matchingYear.map(session=>sessionDateParts(session).month).filter(Boolean))].sort();
   if(sessionFilter.month&&!months.includes(sessionFilter.month)){sessionFilter.month="";sessionFilter.day="";}
-  $("session-filter-month").innerHTML='<option value="">All months</option>'+months.map(month=>`<option value="${month}">${new Intl.DateTimeFormat(undefined,{month:"long"}).format(new Date(2000,Number(month)-1,1))}</option>`).join("");
-  $("session-filter-month").value=sessionFilter.month;
-  $("session-filter-month").disabled=!sessionFilter.year||sessionFilter.year==="legacy";
-
   const matchingMonth=matchingYear.filter(session=>sessionDateParts(session).month===sessionFilter.month);
   const days=[...new Set(matchingMonth.map(session=>sessionDateParts(session).day).filter(Boolean))].sort((a,b)=>Number(a)-Number(b));
   if(sessionFilter.day&&!days.includes(sessionFilter.day))sessionFilter.day="";
-  $("session-filter-day").innerHTML='<option value="">All dates</option>'+days.map(day=>`<option value="${day}">${Number(day)}</option>`).join("");
-  $("session-filter-day").value=sessionFilter.day;
-  $("session-filter-day").disabled=!sessionFilter.month;
   const count=filteredSessions().length;
-  $("session-filter-count").textContent=sessionFilter.year?`${count} session${count===1?"":"s"} found`:"No archive sessions shown";
+  document.querySelectorAll("[data-session-filter]").forEach(query=>{
+    const year=query.querySelector('[data-session-filter-field="year"]'),month=query.querySelector('[data-session-filter-field="month"]'),day=query.querySelector('[data-session-filter-field="day"]');
+    year.innerHTML='<option value="">Choose year</option>'+years.map(value=>`<option value="${esc(value)}">${value==="legacy"?"Legacy / no date":esc(value)}</option>`).join("");
+    year.value=sessionFilter.year;
+    month.innerHTML='<option value="">All months</option>'+months.map(value=>`<option value="${value}">${new Intl.DateTimeFormat(undefined,{month:"long"}).format(new Date(2000,Number(value)-1,1))}</option>`).join("");
+    month.value=sessionFilter.month;month.disabled=!sessionFilter.year||sessionFilter.year==="legacy";
+    day.innerHTML='<option value="">All dates</option>'+days.map(value=>`<option value="${value}">${Number(value)}</option>`).join("");
+    day.value=sessionFilter.day;day.disabled=!sessionFilter.month;
+    query.querySelector("[data-session-filter-count]").textContent=sessionFilter.year?`${count} session${count===1?"":"s"} found`:"No archive sessions shown";
+  });
 }
 function renderSessionLibrary() {
-  const choices=sessionChoices(),matches=filteredSessions(),previous=$("session-select").value;
-  $("session-select").innerHTML=choices.map(session=>`<option value="${esc(session.id)}">${esc(`${session.id===selectedSessionId?"Displayed · ":""}${sessionLabel(session)}`)}</option>`).join("")||'<option value="">Choose a date query</option>';
-  $("session-select").value=choices.some(s=>s.id===selectedSessionId)?selectedSessionId:previous;
-  $("session-cards").innerHTML=matches.map(session=>{
+  const choices=sessionChoices(),matches=filteredSessions();
+  const sessionPagination=pageData(matches,sessionPage);sessionPage=sessionPagination.current;
+  const choiceHtml=choices.map(session=>`<option value="${esc(session.id)}">${esc(`${session.id===selectedSessionId?"Displayed · ":""}${sessionLabel(session)}`)}</option>`).join("")||'<option value="">Choose a date query</option>';
+  document.querySelectorAll("[data-displayed-session-select]").forEach(select=>{select.innerHTML=choiceHtml;select.value=choices.some(session=>session.id===selectedSessionId)?selectedSessionId:"";});
+  $("session-cards").innerHTML=sessionPagination.items.map(session=>{
     const date=session.started_at?new Date(session.started_at).toLocaleString():"Original v0.1/v0.2 files";
     const stream=session.continuous_store,streamText=stream?.details_deferred?"<br>Continuous race data available · detailed continuity is calculated for reports":stream?`<br>Continuous: ${stream.packet_count??"?"} packets · ${stream.event_count??"?"} events · ${stream.missing_frame_estimate??"?"} missing in worst 60 Hz stream (${stream.missing_frame_percent??"?"}%) · ${stream.dropped_packets??0} dropped by storage limit`:"";
     return `<article class="session-card ${session.id===selectedSessionId?"selected":""}" data-session="${esc(session.id)}"><h3>${esc(session.name)}</h3><div class="session-meta">${esc(session.mode.replace("_"," "))} · ${esc(session.track_name)} · ${esc(session.status)}<br>${esc(date)} · ${session.lap_count} laps · best ${fmtTime(session.best_valid_lap_ms)}${streamText}</div></article>`;
   }).join("")||(sessionFilter.year?'<p class="empty-state">No sessions match this date query.</p>':'<p class="empty-state">Choose a year above to show saved sessions.</p>');
+  updatePager("session-prev","session-pagination-label","session-next",sessionPage,sessionPagination.pages,matches.length,"sessions");
   document.querySelectorAll(".session-card").forEach(card=>card.addEventListener("click",()=>selectSession(card.dataset.session)));
   const selected=sessions.find(s=>s.id===selectedSessionId);
-  $("rename-session").value=selected?.read_only?"":selected?.name||"";
+  if(sessionFormSessionId!==selectedSessionId){sessionFormSessionId=selectedSessionId;renameDraftDirty=false;trackDraftDirty=false;}
+  if(!renameDraftDirty) $("rename-session").value=selected?.read_only?"":selected?.name||"";
   $("rename-session").disabled=Boolean(!selected||selected.read_only);
   $("rename-button").disabled=Boolean(!selected||selected.read_only);
   $("delete-session").disabled=Boolean(!selected||!selected.can_delete);
   $("delete-session").title=!selected?"Select a session":selected.read_only?"Legacy captures cannot be deleted":!selected.can_delete?"Stop the active recording before deleting it":"Move this session and its lap files to recoverable local trash";
   $("track-override-row").hidden=Boolean(!selected||!selected.can_override_track_name||selected.read_only);
-  $("track-override").value=selected?.track_name_override||"";
+  if(!trackDraftDirty) $("track-override").value=selected?.track_name_override||"";
   const selectedProfile=circuitProfiles.find(profile=>profile.id===selected?.circuit_profile_id);
   $("session-profile-name").textContent=selectedProfile?.circuit_name||selected?.circuit_profile_id||"None selected";
   $("session-profile-status").textContent=selectedProfile?`${selectedProfile.verification_status} · ${selectedProfile.turns?.length||0} turns · ${selectedProfile.id}`:selected?.circuit_profile_id?"Assigned profile is unavailable; choose another profile.":"Open Circuit Profiler to create or select one.";
   renderRecorder();
 }
-async function selectSession(id){try{await post("/api/sessions/select",{session_id:id});selectedSessionId=id;selectedLapIds.clear();profileEditorDirty=false;pointedTurn=null;selectedTurnIndex=null;circuitTrace=[];suggestedTurns=[];circuitEditor?.setTrace([],[]);comparison=null;$("comparison").hidden=true;$("analysis-empty").hidden=false;await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}}
+async function selectSession(id){if(!id||id===selectedSessionId)return;try{await post("/api/sessions/select",{session_id:id});selectedSessionId=id;selectedLapIds.clear();sessionLapsPage=1;timelinePage=1;profileEditorDirty=false;pointedTurn=null;selectedTurnIndex=null;circuitTrace=[];suggestedTurns=[];circuitEditor?.setTrace([],[]);comparison=null;$("comparison").hidden=true;$("analysis-empty").hidden=false;await loadLibrary({selection:true});}catch(error){setRecorderFeedback(error.message);}}
 
 function selectorSources(){return [...sessionChoices().map(s=>({value:`session:${s.id}`,label:sessionLabel(s)})),...personalBests.filter(pb=>pb.trace_available!==false).map(pb=>({value:`pb:${pb.key}`,label:`Stored PB · ${pb.track_name} · ${pb.mode.replace("_"," ")} · ${fmtTime(pb.time_ms)}${pb.official_time_only?` · captured trace ${fmtTime(pb.comparison_lap_time_ms)}`:""}`}))];}
 function sourceLaps(value){if(value.startsWith("pb:")){const pb=personalBests.find(item=>`pb:${item.key}`===value);return pb&&pb.trace_available!==false?[{...pb,id:pb.comparison_id,number:pb.comparison_source_lap_number??pb.source_lap_number,time_ms:pb.comparison_lap_time_ms??pb.time_ms,invalid:false}]:[];}return allLaps.filter(lap=>`session:${lap.recording_session_id}`===value).sort((a,b)=>a.number-b.number);}
@@ -308,14 +327,16 @@ function populateSelectors(){
 }
 function chosenMeta(side){const source=$(side+"-session").value;if(source.startsWith("pb:")){const pb=personalBests.find(item=>`pb:${item.key}`===source);return pb&&{track_id:pb.track_id,mode:pb.mode,session_id:pb.source_session_id,profile_id:null};}const session=sessions.find(item=>`session:${item.id}`===source);return session&&{track_id:session.track_id,mode:session.mode,session_id:session.id,profile_id:session.circuit_profile_id};}
 function chosenLapMeta(side){const source=$(side+"-session").value;return sourceLaps(source).find(lap=>lap.id===$(side).value);}
-function checkCompatibility(){const b=chosenMeta("baseline"),c=chosenMeta("candidate"),bl=chosenLapMeta("baseline"),cl=chosenLapMeta("candidate");let message="",warnings=[];if(b&&c){if(b.track_id==null||c.track_id==null||b.track_id<0||c.track_id<0)message="Unknown track identity cannot be compared.";else if(b.track_id!==c.track_id)message=`Incompatible circuits: track ID ${b.track_id} versus ${c.track_id}.`;else if(b.mode===c.mode&&b.mode==="race"&&b.session_id!==c.session_id){const profile=circuitProfiles.find(p=>p.id===b.profile_id);if(!profile||b.profile_id!==c.profile_id||profile.verification_status!=="verified")message="Cross-session race comparison requires both sessions to select the same manually verified circuit profile.";}if(!message&&b.mode!==c.mode)warnings.push("Race and Time Trial conditions are not like-for-like; results will be exploratory.");if(bl?.invalid)warnings.push("Baseline is game-invalid and cannot be treated as valid-lap or PB evidence.");if(cl?.invalid)warnings.push("Candidate is game-invalid and cannot be treated as valid-lap or PB evidence.");}$("compare-error").textContent=message;$("compare-warning").textContent=warnings.join("\n");$("compare").disabled=Boolean(message)||!$("baseline").value||!$("candidate").value;}
+function checkCompatibility(){const b=chosenMeta("baseline"),c=chosenMeta("candidate"),bl=chosenLapMeta("baseline"),cl=chosenLapMeta("candidate");let message="",warnings=[];if(b&&c){if(b.track_id==null||c.track_id==null||b.track_id<0||c.track_id<0)message="Unknown track identity cannot be compared.";else if(b.track_id!==c.track_id)message=`Incompatible circuits: track ID ${b.track_id} versus ${c.track_id}.`;else if(b.mode===c.mode&&b.mode==="race"&&b.session_id!==c.session_id){const profile=circuitProfiles.find(p=>p.id===b.profile_id);if(!profile||b.profile_id!==c.profile_id||profile.verification_status!=="verified")message="Cross-session race comparison requires both sessions to select the same manually verified circuit profile.";}if(!message&&b.mode!==c.mode)warnings.push(`${b.mode.replaceAll("_"," ")} and ${c.mode.replaceAll("_"," ")} conditions are not like-for-like; results will be exploratory.`);if(bl?.invalid)warnings.push("Baseline is game-invalid and cannot be treated as valid-lap or PB evidence.");if(cl?.invalid)warnings.push("Candidate is game-invalid and cannot be treated as valid-lap or PB evidence.");}$("compare-error").textContent=message;$("compare-warning").textContent=warnings.join("\n");$("compare").disabled=Boolean(message)||!$("baseline").value||!$("candidate").value;}
 function sampleRate(lap){const seconds=(lap.last_session_time??0)-(lap.first_session_time??0);return seconds>0?`${(lap.sample_count/seconds).toFixed(1)} Hz`:"—";}
 function isControllerEvent(event){return event.type==="controller_input"||event.type==="butn";}
 function renderRaceTimeline(){
   const showController=$("timeline-controller-events").checked;
   const showOther=$("timeline-other-car-events").checked;
   const showSuperseded=$("timeline-superseded-events").checked;
-  const visible=raceTimeline.filter(event=>(showController||!isControllerEvent(event))&&(showOther||event.player_relevant!==false)&&(showSuperseded||event.event_validity!=="superseded")).slice(-200);
+  const filtered=raceTimeline.filter(event=>(showController||!isControllerEvent(event))&&(showOther||event.player_relevant!==false)&&(showSuperseded||event.event_validity!=="superseded"));
+  const pages=Math.max(1,Math.ceil(filtered.length/TIMELINE_PAGE_SIZE));timelinePage=Math.min(Math.max(1,timelinePage),pages);
+  const end=Math.max(0,filtered.length-(timelinePage-1)*TIMELINE_PAGE_SIZE),start=Math.max(0,end-TIMELINE_PAGE_SIZE),visible=filtered.slice(start,end);
   $("race-timeline").innerHTML=visible.length?visible.map(event=>{
     const controller=isControllerEvent(event);
     const validity=event.event_validity||"unknown";
@@ -326,12 +347,35 @@ function renderRaceTimeline(){
     const reason=validity!=="accepted"&&event.validation_reason?` · ${event.validation_reason}`:"";
     return `<div class="timeline-event timeline-${esc(validity)}"><time>${Number(event.session_time).toFixed(3)} s</time><strong>${esc(label)}</strong><span>${esc(event.source)} · lap ${event.lap_number??"—"}${branch} · ${esc(validity)}${controllerStatus}${esc(reason)}</span></div>`;
   }).join(""):raceTimeline.length?'<p class="empty">No events match the current timeline filters.</p>':'<p class="empty">No continuous timeline for this session.</p>';
+  updatePager("timeline-newer","timeline-pagination-label","timeline-older",timelinePage,pages,filtered.length,"events");
+  $("timeline-pagination-label").textContent+=timelinePage===1?" · newest":"";
+}
+function sessionViewIsActive(){return document.querySelector(".view.active")?.id==="view-session";}
+async function ensureSelectedTimeline(){
+  const session=sessions.find(item=>item.id===selectedSessionId),sessionId=session?.id;
+  if(!sessionId||!session?.continuous_store||session.continuous_store.error){raceTimeline=[];if(sessionViewIsActive())renderRaceTimeline();return;}
+  const selectedIsActive=Boolean(activeRecording&&sessionId===activeRecording.id),timelineSafe=!activeRecording||selectedIsActive,cached=timelineBySession.get(sessionId);
+  if(!timelineSafe){raceTimeline=cached?.events||[];if(sessionViewIsActive())renderRaceTimeline();return;}
+  if(cached&&cached.status===session.status&&!selectedIsActive){raceTimeline=cached.events;if(sessionViewIsActive())renderRaceTimeline();return;}
+  if(timelineRequests.has(sessionId))return;
+  if(sessionViewIsActive()&&!cached)$("race-timeline").innerHTML='<p class="empty">Loading event timeline…</p>';
+  const pending=request(`/api/sessions/${encodeURIComponent(sessionId)}/timeline`);
+  timelineRequests.set(sessionId,pending);
+  try{
+    const events=(await pending).events;
+    timelineBySession.set(sessionId,{status:session.status,events});
+    if(selectedSessionId===sessionId){raceTimeline=events;if(sessionViewIsActive())renderRaceTimeline();}
+  }catch(_){
+    if(selectedSessionId===sessionId&&!cached){raceTimeline=[];if(sessionViewIsActive())renderRaceTimeline();}
+  }finally{timelineRequests.delete(sessionId);}
 }
 function renderSession(){
-  const sorted=[...laps].sort((a,b)=>a.time_ms-b.time_ms);$("lap-count").textContent=`${laps.length} lap${laps.length===1?"":"s"}`;
-  $("session-laps").innerHTML=sorted.map(lap=>`<tr class="${lap.invalid?"invalid-row":""}"><td><input type="checkbox" class="lap-export-check" data-id="${esc(lap.id)}" ${selectedLapIds.has(lap.id)?"checked":""} aria-label="Select lap ${lap.number} for export"></td><td>Lap ${lap.number}${lap.invalid?" · INVALID":""}${lap.event_count?`<br><span class="hint">${lap.event_count} flashback/restart event${lap.event_count===1?"":"s"}</span>`:""}</td><td class="time">${fmtTime(lap.time_ms)}</td><td>${fmtTime(lap.sector1_ms)} / ${fmtTime(lap.sector2_ms)}</td><td>${esc(fmtSetup(lap.setup))}</td><td>${lap.sample_count}<br><span class="hint">${sampleRate(lap)}</span></td><td>${lap.peak_speed_kph??"—"} / ${lap.minimum_speed_kph??"—"} km/h</td><td><input class="tag-input" data-id="${esc(lap.id)}" maxlength="240" value="${esc(lap.note)}" placeholder="e.g. rear wing +1"></td><td><button class="edit-setup" data-id="${esc(lap.id)}">Edit/Add setup</button></td></tr>`).join("")||'<tr><td colspan="9">No completed laps in this session.</td></tr>';
+  const sorted=[...laps].sort((a,b)=>a.time_ms-b.time_ms),validTimes=sorted.filter(lap=>!lap.invalid).map(lap=>lap.time_ms),bestValid=validTimes.length?Math.min(...validTimes):null,lapPagination=pageData(sorted,sessionLapsPage),rankStart=lapPagination.start;sessionLapsPage=lapPagination.current;$("lap-count").textContent=`${laps.length} lap${laps.length===1?"":"s"}${bestValid==null?"":` · best ${fmtTime(bestValid)}`}`;
+  $("session-laps").innerHTML=lapPagination.items.map((lap,index)=>{const s3=statsSector3(lap),gap=bestValid==null?"No valid reference":!lap.invalid&&lap.time_ms===bestValid?"Best valid":`${lap.time_ms>=bestValid?"+":"−"}${(Math.abs(lap.time_ms-bestValid)/1000).toFixed(3)} s`,setupState=statsSetupState(lap),coverage=lap.quality?.coverage_pct==null?"Legacy coverage":`${lap.quality.coverage_pct}% coverage`,events=lap.event_count?`${lap.event_count} flashback/restart event${lap.event_count===1?"":"s"}`:"No recorded restart events";return `<tr class="${lap.invalid?"invalid-row":""}"><td><label class="lap-rank-select"><input type="checkbox" class="lap-export-check" data-id="${esc(lap.id)}" ${selectedLapIds.has(lap.id)?"checked":""} aria-label="Select lap ${lap.number} for export"><strong>${rankStart+index+1}</strong></label></td><td class="time">${fmtTime(lap.time_ms)}<br><span class="hint">${gap}</span></td><td>${fmtTime(lap.sector1_ms)} / ${fmtTime(lap.sector2_ms)} / ${fmtTime(s3)}</td><td>Lap ${lap.number}<span class="lap-validity ${lap.invalid?"stats-invalid":"stats-valid"}">${lap.invalid?"INVALID":"valid"}</span><span class="hint">${events}</span></td><td>${esc(tyreCompoundLabel(lap.actual_tyre_compound))}<br><span class="hint">${lap.tyre_age_laps==null?"age unknown":`age ${lap.tyre_age_laps} lap${lap.tyre_age_laps===1?"":"s"}`}</span></td><td><span class="stats-setup-state">${setupState}</span><br><span class="hint">${esc(fmtSetup(lap.setup))}</span></td><td>${coverage}<br><span class="hint">${lap.sample_count} samples · ${sampleRate(lap)}<br>${lap.peak_speed_kph??"—"} / ${lap.minimum_speed_kph??"—"} km/h peak / min</span></td><td><input class="tag-input" data-id="${esc(lap.id)}" maxlength="240" value="${esc(lap.note)}" placeholder="e.g. rear wing +1"></td><td><div class="session-lap-actions"><button data-session-compare="baseline" data-id="${esc(lap.id)}">Baseline</button><button data-session-compare="candidate" data-id="${esc(lap.id)}">Candidate</button><button class="edit-setup" data-id="${esc(lap.id)}">Setup</button></div></td></tr>`;}).join("")||'<tr><td colspan="9" class="empty-state">No completed laps in this session.</td></tr>';
+  updatePager("session-laps-prev","session-laps-pagination-label","session-laps-next",sessionLapsPage,lapPagination.pages,sorted.length,"laps");
   document.querySelectorAll(".tag-input").forEach(input=>input.addEventListener("change",()=>saveNote(input)));
   document.querySelectorAll(".lap-export-check").forEach(input=>input.addEventListener("change",()=>{if(input.checked)selectedLapIds.add(input.dataset.id);else selectedLapIds.delete(input.dataset.id);updateExportCount();}));
+  document.querySelectorAll("[data-session-compare]").forEach(button=>button.addEventListener("click",()=>{const side=button.dataset.sessionCompare,source=`session:${selectedSessionId}`;document.querySelector('[data-view="analysis"]').click();$(side+"-session").value=source;populateLapSelector(side,button.dataset.id);$(side).value=button.dataset.id;checkCompatibility();}));
   document.querySelectorAll(".edit-setup").forEach(button=>button.addEventListener("click",()=>openSetupEditor(button.dataset.id)));
   updateExportCount();
   renderProfileEditor();
@@ -391,7 +435,9 @@ function updateExportCount(){const scope=exportScope(),count=scope==="session"?l
 function downloadExport(format){const scope=exportScope();if(scope==="selected"&&!selectedLapIds.size){$("export-error").textContent="Select at least one lap.";return;}const session=sessions.find(item=>item.id===selectedSessionId),report=$("report-type").value;if(report==="race"&&session?.mode!=="race"){$("export-error").textContent="Race reports require a race session.";return;}if(report==="time_trial"&&session?.mode!=="time_trial"){$("export-error").textContent="Time Trial reports require a Time Trial session.";return;}$("export-error").textContent="";const query=new URLSearchParams({scope,format,report});if(scope==="selected")for(const id of selectedLapIds)query.append("lap",id);const link=document.createElement("a");link.href=`/api/sessions/${encodeURIComponent(selectedSessionId)}/export?${query}`;link.click();}
 
 function renderPersonalBests(){
-  $("pb-cards").innerHTML=personalBests.map(pb=>`<article class="pb-card"><span class="hint">${esc(pb.track_name)} · ${esc(pb.mode.replace("_"," "))}</span><strong>${fmtTime(pb.time_ms)}</strong><div class="hint">${esc(pb.source_session_name)} · ${new Date(pb.became_pb_at).toLocaleString()}<br>${pb.official_time_only?`Official game timing · telemetry trace incomplete${pb.trace_available?`<br>Comparison trace ${fmtTime(pb.comparison_lap_time_ms)} · Lap ${pb.comparison_source_lap_number}`:""}`:`Setup ${esc(fmtSetup(pb.setup))}`}</div><button class="pb-open" data-key="${esc(pb.key)}">Open details</button>${pb.trace_available!==false?`<button class="pb-use" data-side="baseline" data-key="${esc(pb.key)}">Baseline</button><button class="pb-use" data-side="candidate" data-key="${esc(pb.key)}">Candidate</button>`:""}</article>`).join("")||'<p class="empty">No eligible personal bests stored yet. Complete a valid full lap or rebuild from saved sessions.</p>';
+  const pbPagination=pageData(personalBests,pbPage);pbPage=pbPagination.current;
+  $("pb-cards").innerHTML=pbPagination.items.map(pb=>`<article class="pb-card"><span class="hint">${esc(pb.track_name)} · ${esc(pb.mode.replace("_"," "))}</span><strong>${fmtTime(pb.time_ms)}</strong><div class="hint">${esc(pb.source_session_name)} · ${new Date(pb.became_pb_at).toLocaleString()}<br>${pb.official_time_only?`Official game timing · telemetry trace incomplete${pb.trace_available?`<br>Comparison trace ${fmtTime(pb.comparison_lap_time_ms)} · Lap ${pb.comparison_source_lap_number}`:""}`:`Setup ${esc(fmtSetup(pb.setup))}`}</div><button class="pb-open" data-key="${esc(pb.key)}">Open details</button>${pb.trace_available!==false?`<button class="pb-use" data-side="baseline" data-key="${esc(pb.key)}">Baseline</button><button class="pb-use" data-side="candidate" data-key="${esc(pb.key)}">Candidate</button>`:""}</article>`).join("")||'<p class="empty">No eligible personal bests stored yet. Complete a valid full lap or rebuild from saved sessions.</p>';
+  updatePager("pb-prev","pb-pagination-label","pb-next",pbPage,pbPagination.pages,personalBests.length,"PBs");
   document.querySelectorAll(".pb-open").forEach(button=>button.addEventListener("click",()=>openPersonalBest(button.dataset.key)));
   document.querySelectorAll(".pb-use").forEach(button=>button.addEventListener("click",()=>{const side=button.dataset.side;$(side+"-session").value=`pb:${button.dataset.key}`;populateLapSelector(side);$("pb-message").textContent=`Personal best selected as ${side}.`;}));
 }
@@ -446,16 +492,16 @@ function drawPaceMap(data){
 }
 function drawCharts(data){
   const trace=data.trace,delta=trace.map(row=>row.delta_s),speedsB=trace.map(row=>row.baseline.speed_kph),speedsC=trace.map(row=>row.candidate.speed_kph),deltaRange=Math.max(.1,...delta.map(Math.abs));
-  chart(document.querySelector('[data-chart="delta"]'),[{label:"Candidate − baseline",color:colors.yellow,values:delta}],-deltaRange,deltaRange," s",2);
-  chart(document.querySelector('[data-chart="speed"]'),[{label:"Baseline speed",color:colors.green,values:speedsB},{label:"Candidate speed",color:colors.orange,values:speedsC}],0,Math.ceil(Math.max(...speedsB,...speedsC)/50)*50," km/h");
+  chart(document.querySelector('[data-chart="delta"]'),[{label:"Candidate − baseline",color:colors.delta,values:delta}],-deltaRange,deltaRange," s",2);
+  chart(document.querySelector('[data-chart="speed"]'),[{label:"Baseline speed",color:colors.baseline,values:speedsB},{label:"Candidate speed",color:colors.candidate,values:speedsC}],0,Math.ceil(Math.max(...speedsB,...speedsC)/50)*50," km/h");
   drawPaceMap(data);
-  chart(document.querySelector('[data-chart="pedals"]'),[{label:"Baseline throttle",color:colors.green,values:trace.map(r=>r.baseline.throttle)},{label:"Candidate throttle",color:colors.orange,values:trace.map(r=>r.candidate.throttle)},{label:"Baseline brake",color:colors.blue,values:trace.map(r=>r.baseline.brake)},{label:"Candidate brake",color:colors.red,values:trace.map(r=>r.candidate.brake)}],0,100,"% ");
+  chart(document.querySelector('[data-chart="pedals"]'),[{label:"Baseline throttle",color:colors.baseline,values:trace.map(r=>r.baseline.throttle)},{label:"Candidate throttle",color:colors.candidate,values:trace.map(r=>r.candidate.throttle)},{label:"Baseline brake",color:colors.baselineAlt,values:trace.map(r=>r.baseline.brake)},{label:"Candidate brake",color:colors.candidateAlt,values:trace.map(r=>r.candidate.brake)}],0,100,"% ");
   const motionValues=trace.flatMap(r=>[r.baseline.front_wheels_angle,r.candidate.front_wheels_angle,r.baseline.chassis_yaw,r.candidate.chassis_yaw]).filter(Number.isFinite),motionPanel=$("motion-ex-panel");motionPanel.hidden=!motionValues.length;
-  if(motionValues.length){const range=Math.max(.05,...motionValues.map(Math.abs));chart(document.querySelector('[data-chart="motion-ex"]'),[{label:"Baseline front-wheel angle",color:colors.green,values:trace.map(r=>r.baseline.front_wheels_angle??0)},{label:"Candidate front-wheel angle",color:colors.orange,values:trace.map(r=>r.candidate.front_wheels_angle??0)},{label:"Baseline chassis yaw",color:colors.blue,values:trace.map(r=>r.baseline.chassis_yaw??0)},{label:"Candidate chassis yaw",color:colors.red,values:trace.map(r=>r.candidate.chassis_yaw??0)}],-range,range," rad",3);}
+  if(motionValues.length){const range=Math.max(.05,...motionValues.map(Math.abs));chart(document.querySelector('[data-chart="motion-ex"]'),[{label:"Baseline front-wheel angle",color:colors.baseline,values:trace.map(r=>r.baseline.front_wheels_angle??0)},{label:"Candidate front-wheel angle",color:colors.candidate,values:trace.map(r=>r.candidate.front_wheels_angle??0)},{label:"Baseline chassis yaw",color:colors.baselineAlt,values:trace.map(r=>r.baseline.chassis_yaw??0)},{label:"Candidate chassis yaw",color:colors.candidateAlt,values:trace.map(r=>r.candidate.chassis_yaw??0)}],-range,range," rad",3);}
   const slipValues=trace.flatMap(r=>[r.baseline.front_wheel_slip_ratio,r.candidate.front_wheel_slip_ratio,r.baseline.rear_wheel_slip_ratio,r.candidate.rear_wheel_slip_ratio]).filter(Number.isFinite),slipPanel=$("wheel-slip-panel");slipPanel.hidden=!slipValues.length;
-  if(slipValues.length){const maximum=Math.max(.05,...slipValues);chart(document.querySelector('[data-chart="wheel-slip"]'),[{label:"Baseline front",color:colors.green,values:trace.map(r=>r.baseline.front_wheel_slip_ratio??0)},{label:"Candidate front",color:colors.orange,values:trace.map(r=>r.candidate.front_wheel_slip_ratio??0)},{label:"Baseline rear",color:colors.blue,values:trace.map(r=>r.baseline.rear_wheel_slip_ratio??0)},{label:"Candidate rear",color:colors.red,values:trace.map(r=>r.candidate.rear_wheel_slip_ratio??0)}],0,maximum,"",3);}
+  if(slipValues.length){const maximum=Math.max(.05,...slipValues);chart(document.querySelector('[data-chart="wheel-slip"]'),[{label:"Baseline front",color:colors.baseline,values:trace.map(r=>r.baseline.front_wheel_slip_ratio??0)},{label:"Candidate front",color:colors.candidate,values:trace.map(r=>r.candidate.front_wheel_slip_ratio??0)},{label:"Baseline rear",color:colors.baselineAlt,values:trace.map(r=>r.baseline.rear_wheel_slip_ratio??0)},{label:"Candidate rear",color:colors.candidateAlt,values:trace.map(r=>r.candidate.rear_wheel_slip_ratio??0)}],0,maximum,"",3);}
   const angleValues=trace.flatMap(r=>[r.baseline.front_wheel_slip_angle,r.candidate.front_wheel_slip_angle,r.baseline.rear_wheel_slip_angle,r.candidate.rear_wheel_slip_angle]).filter(Number.isFinite),anglePanel=$("slip-angle-panel");anglePanel.hidden=!angleValues.length;
-  if(angleValues.length){const maximum=Math.max(.05,...angleValues);chart(document.querySelector('[data-chart="slip-angle"]'),[{label:"Baseline front",color:colors.green,values:trace.map(r=>r.baseline.front_wheel_slip_angle??0)},{label:"Candidate front",color:colors.orange,values:trace.map(r=>r.candidate.front_wheel_slip_angle??0)},{label:"Baseline rear",color:colors.blue,values:trace.map(r=>r.baseline.rear_wheel_slip_angle??0)},{label:"Candidate rear",color:colors.red,values:trace.map(r=>r.candidate.rear_wheel_slip_angle??0)}],0,maximum," rad",3);}
+  if(angleValues.length){const maximum=Math.max(.05,...angleValues);chart(document.querySelector('[data-chart="slip-angle"]'),[{label:"Baseline front",color:colors.baseline,values:trace.map(r=>r.baseline.front_wheel_slip_angle??0)},{label:"Candidate front",color:colors.candidate,values:trace.map(r=>r.candidate.front_wheel_slip_angle??0)},{label:"Baseline rear",color:colors.baselineAlt,values:trace.map(r=>r.baseline.rear_wheel_slip_angle??0)},{label:"Candidate rear",color:colors.candidateAlt,values:trace.map(r=>r.candidate.rear_wheel_slip_angle??0)}],0,maximum," rad",3);}
 }
 
 function invalidateComparison(){comparison=null;$("download-comparison-report").disabled=true;}
@@ -464,31 +510,46 @@ $("download-comparison-report").addEventListener("click",()=>{if(!comparison)ret
 $("baseline-session").addEventListener("change",()=>{invalidateComparison();populateLapSelector("baseline");});
 $("candidate-session").addEventListener("change",()=>{invalidateComparison();populateLapSelector("candidate");});
 $("baseline").addEventListener("change",()=>{invalidateComparison();checkCompatibility();});$("candidate").addEventListener("change",()=>{invalidateComparison();checkCompatibility();});
-$("session-select").addEventListener("change",event=>selectSession(event.target.value));
+document.querySelectorAll("[data-displayed-session-select]").forEach(select=>select.addEventListener("change",event=>selectSession(event.target.value)));
+$("rename-session").addEventListener("input",()=>{renameDraftDirty=true;});
+$("track-override").addEventListener("input",()=>{trackDraftDirty=true;});
 function refreshSessionQueryViews(){renderSessionQuery();renderSessionLibrary();populateSelectors();}
-$("session-filter-year").addEventListener("change",event=>{sessionFilter={year:event.target.value,month:"",day:""};refreshSessionQueryViews();});
-$("session-filter-month").addEventListener("change",event=>{sessionFilter.month=event.target.value;sessionFilter.day="";refreshSessionQueryViews();});
-$("session-filter-day").addEventListener("change",event=>{sessionFilter.day=event.target.value;refreshSessionQueryViews();});
-$("session-filter-clear").addEventListener("click",()=>{sessionFilter={year:"",month:"",day:""};refreshSessionQueryViews();});
-for(const id of ["stats-track","stats-mode","stats-validity","stats-session","stats-year","stats-compound","stats-setup","stats-quality","stats-order"]){$(id).addEventListener("change",()=>{circuitStatsPage=1;renderCircuitStats();});}
-$("stats-search").addEventListener("input",()=>{circuitStatsPage=1;renderCircuitStats();});
-$("stats-reset").addEventListener("click",()=>{$("stats-mode").value="all";$("stats-validity").value="valid";$("stats-session").value="all";$("stats-year").value="all";$("stats-compound").value="all";$("stats-setup").value="all";$("stats-quality").value="all";$("stats-order").value="best";$("stats-search").value="";circuitStatsPage=1;renderCircuitStats();});
+document.querySelectorAll('[data-session-filter-field="year"]').forEach(select=>select.addEventListener("change",event=>{sessionFilter={year:event.target.value,month:"",day:""};sessionPage=1;refreshSessionQueryViews();}));
+document.querySelectorAll('[data-session-filter-field="month"]').forEach(select=>select.addEventListener("change",event=>{sessionFilter.month=event.target.value;sessionFilter.day="";sessionPage=1;refreshSessionQueryViews();}));
+document.querySelectorAll('[data-session-filter-field="day"]').forEach(select=>select.addEventListener("change",event=>{sessionFilter.day=event.target.value;sessionPage=1;refreshSessionQueryViews();}));
+document.querySelectorAll("[data-session-filter-clear]").forEach(button=>button.addEventListener("click",()=>{sessionFilter={year:"",month:"",day:""};sessionPage=1;refreshSessionQueryViews();}));
+for(const id of ["stats-track","stats-mode","stats-validity","stats-session","stats-year","stats-compound","stats-setup","stats-quality","stats-order"]){$(id).addEventListener("change",()=>{circuitStatsPage=1;raceStatsPage=1;renderCircuitStats();});}
+$("stats-search").addEventListener("input",()=>{circuitStatsPage=1;raceStatsPage=1;renderCircuitStats();});
+$("stats-reset").addEventListener("click",()=>{$("stats-mode").value="all";$("stats-validity").value="valid";$("stats-session").value="all";$("stats-year").value="all";$("stats-compound").value="all";$("stats-setup").value="all";$("stats-quality").value="all";$("stats-order").value="best";$("stats-search").value="";circuitStatsPage=1;raceStatsPage=1;renderCircuitStats();});
 $("stats-prev").addEventListener("click",()=>{if(circuitStatsPage>1){circuitStatsPage-=1;renderCircuitStats();}});
 $("stats-next").addEventListener("click",()=>{circuitStatsPage+=1;renderCircuitStats();});
+$("race-stats-prev").addEventListener("click",()=>{if(raceStatsPage>1){raceStatsPage-=1;renderRaceStats();}});
+$("race-stats-next").addEventListener("click",()=>{raceStatsPage+=1;renderRaceStats();});
+$("session-prev").addEventListener("click",()=>{if(sessionPage>1){sessionPage-=1;renderSessionLibrary();}});
+$("session-next").addEventListener("click",()=>{sessionPage+=1;renderSessionLibrary();});
+$("session-laps-prev").addEventListener("click",()=>{if(sessionLapsPage>1){sessionLapsPage-=1;renderSession();}});
+$("session-laps-next").addEventListener("click",()=>{sessionLapsPage+=1;renderSession();});
+$("pb-prev").addEventListener("click",()=>{if(pbPage>1){pbPage-=1;renderPersonalBests();}});
+$("pb-next").addEventListener("click",()=>{pbPage+=1;renderPersonalBests();});
+$("deleted-prev").addEventListener("click",()=>{if(deletedPage>1){deletedPage-=1;renderSettings();}});
+$("deleted-next").addEventListener("click",()=>{deletedPage+=1;renderSettings();});
 $("pace-map-reset").addEventListener("click",()=>paceMapCanvas?.resetView());
 $("pace-map-rotate-left").addEventListener("click",()=>paceMapCanvas?.rotateBy(-10));
 $("pace-map-rotate-right").addEventListener("click",()=>paceMapCanvas?.rotateBy(10));
-$("timeline-controller-events").addEventListener("change",renderRaceTimeline);
-$("timeline-other-car-events").addEventListener("change",renderRaceTimeline);
-$("timeline-superseded-events").addEventListener("change",renderRaceTimeline);
-$("start-run").addEventListener("click",async()=>{try{await post("/api/runs/start",{name:$("run-name").value});$("run-name").value="";await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
-$("stop-recording").addEventListener("click",async()=>{try{await post("/api/recording/stop");await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
-$("diagnostic-enabled").addEventListener("change",async event=>{event.target.disabled=true;try{diagnosticState=await post("/api/diagnostics",{enabled:event.target.checked});renderRecorder();}catch(error){$("recording-message").textContent=error.message;}finally{event.target.disabled=false;}});
+$("timeline-controller-events").addEventListener("change",()=>{timelinePage=1;renderRaceTimeline();});
+$("timeline-other-car-events").addEventListener("change",()=>{timelinePage=1;renderRaceTimeline();});
+$("timeline-superseded-events").addEventListener("change",()=>{timelinePage=1;renderRaceTimeline();});
+$("timeline-newer").addEventListener("click",()=>{if(timelinePage>1){timelinePage-=1;renderRaceTimeline();}});
+$("timeline-older").addEventListener("click",()=>{timelinePage+=1;renderRaceTimeline();});
+$("start-run").addEventListener("click",async()=>{try{await post("/api/runs/start",{name:$("run-name").value});$("run-name").value="";await loadLibrary();}catch(error){setRecorderFeedback(error.message);}});
+$("stop-recording").addEventListener("click",async()=>{try{await post("/api/recording/stop");await loadLibrary();}catch(error){setRecorderFeedback(error.message);}});
+$("diagnostic-enabled").addEventListener("change",async event=>{event.target.disabled=true;try{diagnosticState=await post("/api/diagnostics",{enabled:event.target.checked});renderRecorder();}catch(error){setRecorderFeedback(error.message);}finally{event.target.disabled=false;}});
 $("jump-active").addEventListener("click",()=>activeRecording&&selectSession(activeRecording.id));
-$("rename-button").addEventListener("click",async()=>{try{await post(`/api/sessions/${encodeURIComponent(selectedSessionId)}/rename`,{name:$("rename-session").value});await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
-$("delete-session").addEventListener("click",async()=>{const selected=sessions.find(session=>session.id===selectedSessionId);if(!selected||!selected.can_delete)return;if(!window.confirm(`Delete session “${selected.name}” and its ${selected.lap_count} lap file(s)?\n\nIt will be moved to local trash. Stored PB snapshots and notes will be preserved.`))return;try{const result=await post(`/api/sessions/${encodeURIComponent(selected.id)}/delete`,{confirm:true});selectedLapIds.clear();comparison=null;editingLap=null;selectedSessionId=result.selected_session_id;await loadLibrary();$("recording-message").textContent=`Session moved to ${result.moved_to}. PB snapshots and notes were preserved.`;}catch(error){$("recording-message").textContent=error.message;}});
-$("settings-form").addEventListener("submit",async event=>{event.preventDefault();const payload={web_host:$("setting-web-host").value,web_port:Number($("setting-web-port").value),udp_port:Number($("setting-udp-port").value),trash_retention_days:Number($("setting-trash-days").value),max_recording_gb:Number($("setting-max-recording").value),diagnostic_max_mb:Number($("setting-diagnostic-mb").value),dashboard_refresh_seconds:Number($("setting-refresh-seconds").value)};try{const result=await post("/api/settings",payload);dashboardSettings=result.settings;const restart=result.restart_required||[];$("settings-message").textContent=`Settings saved.${restart.length?` Restart the server to apply: ${restart.join(", ")}.`:" Applied without restart."}${result.purge?.purged?.length?` Permanently removed ${result.purge.purged.length} expired session(s).`:""}`;await loadLibrary();}catch(error){$("settings-message").textContent=error.message;}});
-$("track-override-button").addEventListener("click",async()=>{try{await post(`/api/sessions/${encodeURIComponent(selectedSessionId)}/track-name`,{name:$("track-override").value});await loadLibrary();}catch(error){$("recording-message").textContent=error.message;}});
+$("rename-button").addEventListener("click",async()=>{try{await post(`/api/sessions/${encodeURIComponent(selectedSessionId)}/rename`,{name:$("rename-session").value});renameDraftDirty=false;await loadLibrary();}catch(error){setRecorderFeedback(error.message);}});
+$("delete-session").addEventListener("click",async()=>{const selected=sessions.find(session=>session.id===selectedSessionId);if(!selected||!selected.can_delete)return;if(!window.confirm(`Delete session “${selected.name}” and its ${selected.lap_count} lap file(s)?\n\nIt will be moved to local trash. Stored PB snapshots and notes will be preserved.`))return;try{const result=await post(`/api/sessions/${encodeURIComponent(selected.id)}/delete`,{confirm:true});selectedLapIds.clear();comparison=null;editingLap=null;selectedSessionId=result.selected_session_id;await loadLibrary();setRecorderFeedback(`Session moved to ${result.moved_to}. PB snapshots and notes were preserved.`);}catch(error){setRecorderFeedback(error.message);}});
+$("settings-form").addEventListener("input",()=>{settingsDraftDirty=true;});
+$("settings-form").addEventListener("submit",async event=>{event.preventDefault();const payload={web_host:$("setting-web-host").value,web_port:Number($("setting-web-port").value),udp_port:Number($("setting-udp-port").value),trash_retention_days:Number($("setting-trash-days").value),max_recording_gb:Number($("setting-max-recording").value),diagnostic_max_mb:Number($("setting-diagnostic-mb").value),dashboard_refresh_seconds:Number($("setting-refresh-seconds").value)};try{const result=await post("/api/settings",payload);dashboardSettings=result.settings;settingsDraftDirty=false;const restart=result.restart_required||[];$("settings-message").textContent=`Settings saved.${restart.length?` Restart the server to apply: ${restart.join(", ")}.`:" Applied without restart."}${result.purge?.purged?.length?` Permanently removed ${result.purge.purged.length} expired session(s).`:""}`;await loadLibrary();}catch(error){$("settings-message").textContent=error.message;}});
+$("track-override-button").addEventListener("click",async()=>{try{await post(`/api/sessions/${encodeURIComponent(selectedSessionId)}/track-name`,{name:$("track-override").value});trackDraftDirty=false;await loadLibrary();}catch(error){setRecorderFeedback(error.message);}});
 $("edit-session-profile").addEventListener("click",()=>document.querySelector('[data-view="circuit-profiler"]').click());
 $("profile-select").addEventListener("change",()=>{profileEditorDirty=false;pointedTurn=null;showProfileFields();setPointingStatus();});
 $("profile-load-saved").addEventListener("click",loadSavedProfile);
@@ -519,28 +580,83 @@ $("rebuild-pbs").addEventListener("click",async()=>{try{const result=await post(
 $("setup-close").addEventListener("click",()=>$("setup-dialog").close());
 $("setup-form").addEventListener("submit",async event=>{event.preventDefault();const changed={};document.querySelectorAll("#setup-fields input").forEach(input=>{if(input.value!==input.dataset.original&&input.value!=="")changed[input.dataset.key]=Number(input.value);});if(!Object.keys(changed).length){$("setup-message").textContent="No values changed.";return;}try{const result=await post(`/api/laps/${encodeURIComponent(editingLap.id)}/setup`,{setup:changed});$("setup-message").textContent=`Saved. ${result.pb_message}. Audit: ${result.audit_record}`;setTimeout(()=>$("setup-dialog").close(),900);await loadLibrary();}catch(error){$("setup-message").textContent=error.message;}});
 
-async function loadLibrary(){
-  const settingsFallback={settings:{web_host:"127.0.0.1",web_port:8025,udp_port:20777,trash_retention_days:30,max_recording_gb:8,diagnostic_max_mb:50,dashboard_refresh_seconds:8},deleted_sessions:[],receiver_ips:["127.0.0.1"]},[data,pbData,schema,settingsData]=await Promise.all([request("/api/sessions"),request("/api/personal-bests"),request("/api/setup-schema"),request("/api/settings").catch(()=>settingsFallback)]);sessions=data.sessions;personalBests=pbData.personal_bests;setupFields=schema.fields;selectedSessionId=data.selected_session_id;activeRecording=data.recording;diagnosticState=data.diagnostics||{};latestState={...latestState,...data.latest};dashboardSettings=settingsData.settings||{};deletedSessions=settingsData.deleted_sessions||[];receiverIps=settingsData.receiver_ips||[];
-  const draftId=profileEditorDirty?$("profile-select").value:"",draft=circuitProfiles.find(profile=>profile.id===draftId),loadedProfiles=(await request(`/api/circuit-profiles?session=${encodeURIComponent(selectedSessionId||"")}`)).profiles;circuitProfiles=draft&&!loadedProfiles.some(profile=>profile.id===draft.id)?[...loadedProfiles,draft]:loadedProfiles;
-  // Loading every historical lap group on every live refresh caused the UDP
-  // thread to compete with thousands of unnecessary HTTP/file operations.
-  // Prime the cache once, then refresh only the displayed and active sessions
-  // until recording has stopped.
-  const refreshIds=activeRecording&&lapsBySession.size
-    ? [...new Set([selectedSessionId,activeRecording.id].filter(Boolean))]
-    : sessions.map(session=>session.id);
-  const groups=await Promise.all(refreshIds.map(id=>request(`/api/sessions/${encodeURIComponent(id)}/laps`)));
-  groups.forEach(group=>lapsBySession.set(group.session_id,group.laps));
-  const knownIds=new Set(sessions.map(session=>session.id));
-  for(const id of lapsBySession.keys())if(!knownIds.has(id))lapsBySession.delete(id);
-  allLaps=[...lapsBySession.values()].flat();laps=lapsBySession.get(selectedSessionId)||[];
-  const selected=sessions.find(session=>session.id===selectedSessionId);raceTimeline=[];
-  // Do not repeatedly reconstruct a historical database while another
-  // session is recording. The active session uses its bounded live event
-  // cache; full accepted/superseded reconstruction resumes after closure.
-  const timelineSafe=!activeRecording||selectedSessionId===activeRecording.id;
-  if(timelineSafe&&selected?.continuous_store&&!selected.continuous_store.error){try{raceTimeline=(await request(`/api/sessions/${encodeURIComponent(selectedSessionId)}/timeline`)).events;}catch(_){raceTimeline=[];}}
-  selectedLapIds=new Set([...selectedLapIds].filter(id=>laps.some(lap=>lap.id===id)));renderSessionQuery();renderSessionLibrary();renderPersonalBests();populateSelectors();renderCircuitStats();renderSettings();scheduleLibraryRefresh();if(!document.querySelector(".tag-input:focus"))renderSession();
+function sessionSyncKey(session){return JSON.stringify([session.id,session.name,session.mode,session.status,session.started_at,session.ended_at,session.track_id,session.track_name,session.track_name_override,session.track_length_m,session.lap_count,session.best_valid_lap_ms,session.circuit_profile_id,session.can_delete,session.game_session_type,session.game_session_name,session.final_classification]);}
+function sessionListKey(items){return items.map(sessionSyncKey).join("|");}
+function cacheAllLaps(items){lapsBySession.clear();for(const session of sessions)lapsBySession.set(session.id,[]);for(const lap of items){if(!lapsBySession.has(lap.recording_session_id))lapsBySession.set(lap.recording_session_id,[]);lapsBySession.get(lap.recording_session_id).push(lap);}}
+
+async function loadLibrary(options={}){
+  const background=options.background===true;
+  const selection=options.selection===true;
+  if(background&&document.hidden)return;
+  if(libraryRequestPending){if(!background)libraryReloadRequested=true;return;}
+  libraryRequestPending=true;
+  const initial=!libraryInitialized,force=!background&&!selection;
+  try{
+    const previousSessions=sessions,previousSessionKey=sessionListKey(previousSessions),previousSelected=syncedSelectedSessionId;
+    const settingsFallback={settings:{web_host:"127.0.0.1",web_port:8025,udp_port:20777,trash_retention_days:30,max_recording_gb:8,diagnostic_max_mb:50,dashboard_refresh_seconds:8},deleted_sessions:[],receiver_ips:["127.0.0.1"]};
+    const data=await request("/api/sessions");
+    sessions=data.sessions;selectedSessionId=data.selected_session_id;activeRecording=data.recording;diagnosticState=data.diagnostics||{};latestState={...latestState,...data.latest};
+    const selectedChanged=previousSelected!==selectedSessionId,metadataChanged=initial||previousSessionKey!==sessionListKey(sessions);
+    syncedSelectedSessionId=selectedSessionId;
+
+    let settingsChanged=false,pbChanged=false,schemaChanged=false;
+    if(initial||force){
+      const [pbData,schema,settingsData]=await Promise.all([request("/api/personal-bests"),request("/api/setup-schema"),request("/api/settings").catch(()=>settingsFallback)]);
+      const oldPB=JSON.stringify(personalBests),oldSchema=JSON.stringify(setupFields),oldSettings=JSON.stringify([dashboardSettings,deletedSessions,receiverIps]);
+      personalBests=pbData.personal_bests;setupFields=schema.fields;dashboardSettings=settingsData.settings||{};deletedSessions=settingsData.deleted_sessions||[];receiverIps=settingsData.receiver_ips||[];
+      pbChanged=initial||oldPB!==JSON.stringify(personalBests);schemaChanged=initial||oldSchema!==JSON.stringify(setupFields);settingsChanged=initial||oldSettings!==JSON.stringify([dashboardSettings,deletedSessions,receiverIps]);
+    }
+
+    const previousById=new Map(previousSessions.map(session=>[session.id,session]));
+    let changedLapIds=[];
+    if(initial){
+      cacheAllLaps((await request("/api/laps?all=1")).laps);
+      changedLapIds=sessions.map(session=>session.id);
+    }else{
+      changedLapIds=sessions.filter(session=>{
+        const previous=previousById.get(session.id),cached=lapsBySession.get(session.id);
+        return !previous||!cached||Number(previous.lap_count)!==Number(session.lap_count)||(force&&session.id===selectedSessionId);
+      }).map(session=>session.id);
+      const groups=await Promise.all(changedLapIds.map(id=>request(`/api/sessions/${encodeURIComponent(id)}/laps`)));
+      groups.forEach(group=>lapsBySession.set(group.session_id,group.laps));
+      if(background&&changedLapIds.length){const pbData=await request("/api/personal-bests");const oldPB=JSON.stringify(personalBests);personalBests=pbData.personal_bests;pbChanged=oldPB!==JSON.stringify(personalBests);}
+    }
+    const knownIds=new Set(sessions.map(session=>session.id));
+    for(const id of lapsBySession.keys())if(!knownIds.has(id))lapsBySession.delete(id);
+    for(const id of timelineBySession.keys())if(!knownIds.has(id))timelineBySession.delete(id);
+    allLaps=[...lapsBySession.values()].flat();laps=lapsBySession.get(selectedSessionId)||[];
+    const selectedLapsChanged=initial||selectedChanged||changedLapIds.includes(selectedSessionId);
+
+    let profilesChanged=false;
+    if(initial||force||selectedChanged){
+      const draftId=profileEditorDirty?$("profile-select").value:"",draft=circuitProfiles.find(profile=>profile.id===draftId),loadedProfiles=(await request(`/api/circuit-profiles?session=${encodeURIComponent(selectedSessionId||"")}`)).profiles,oldProfiles=JSON.stringify(circuitProfiles);
+      circuitProfiles=draft&&!loadedProfiles.some(profile=>profile.id===draft.id)?[...loadedProfiles,draft]:loadedProfiles;
+      profilesChanged=initial||oldProfiles!==JSON.stringify(circuitProfiles);
+    }
+
+    raceTimeline=timelineBySession.get(selectedSessionId)?.events||[];
+    selectedLapIds=new Set([...selectedLapIds].filter(id=>laps.some(lap=>lap.id===id)));
+
+    if(initial||metadataChanged||selectedChanged){renderSessionQuery();renderSessionLibrary();}
+    if(initial||pbChanged)renderPersonalBests();
+    if(initial||metadataChanged||selectedLapsChanged||pbChanged||profilesChanged)populateSelectors();
+    if(initial||metadataChanged||selectedLapsChanged||schemaChanged)renderCircuitStats();
+    if(initial||settingsChanged)renderSettings();
+    if(initial||selectedLapsChanged||profilesChanged||selectedChanged){if(!document.querySelector(".tag-input:focus"))renderSession();}
+    if(sessionViewIsActive())void ensureSelectedTimeline();
+    scheduleLibraryRefresh();libraryInitialized=true;
+  }catch(error){if(!background)setRecorderFeedback(error.message);}
+  finally{
+    libraryRequestPending=false;
+    if(libraryReloadRequested){libraryReloadRequested=false;void loadLibrary();}
+  }
 }
-async function refreshLive(){try{const data=await request("/api/snapshot");activeRecording=data.recording;selectedSessionId=data.selected_session_id;diagnosticState=data.diagnostics||{};renderLive(data.latest);renderRecorder();}catch(_){$("connection").textContent="Dashboard offline";$("connection").classList.remove("online");}}
+async function refreshLive(){
+  if(document.hidden||liveRequestPending)return;
+  liveRequestPending=true;
+  try{const data=await request("/api/live");activeRecording=data.recording;diagnosticState=data.diagnostics||{};renderLive(data.latest);renderRecorder();}
+  catch(_){$("connection").textContent="Dashboard offline";$("connection").classList.remove("online");}
+  finally{liveRequestPending=false;}
+}
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){void refreshLive();void loadLibrary({background:true});}});
 loadLibrary();refreshLive();setInterval(refreshLive,1000);scheduleLibraryRefresh();

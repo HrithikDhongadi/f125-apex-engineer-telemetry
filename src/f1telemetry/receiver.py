@@ -32,6 +32,8 @@ from .settings import SettingsStore
 LEGACY_SESSION_ID = "legacy"
 OPEN_STATUSES = {"armed", "recording"}
 RACE_UID_REOPEN_GUARD_SECONDS = 5.0
+AUTOMATIC_RECORDING_MODES = {"practice", "qualifying", "race"}
+ONE_SHOT_SESSION_TYPES = {9, 14}
 MAX_DIAGNOSTIC_SEGMENTS = 8
 MAX_DIAGNOSTIC_EVENTS = 50_000
 MAX_DIAGNOSTIC_BYTES = 50 * 1024 * 1024
@@ -132,6 +134,8 @@ class RecordingSession:
     track_id: int | None
     track_length_m: int | None
     lap_ids: list[str] = field(default_factory=list)
+    game_session_type: int | None = None
+    game_session_name: str | None = None
     track_name_override: str | None = None
     packet_format: int = 2025
     sector2_start_m: float | None = None
@@ -214,7 +218,7 @@ class SessionStore:
         self.sector3_start_m: float | None = None
         self.active_recording_id: str | None = None
         self.selected_session_id: str | None = None
-        self.manual_stop_uid: int | None = None
+        self.manual_stop_session_key: tuple[int, int] | None = None
         self.race_uid_reopen_guard: dict[int, float] = {}
         self.current_setup: dict[str, Any] | None = None
         self.active_lap_number: int | None = None
@@ -343,7 +347,7 @@ class SessionStore:
         self.sector2_start_m, self.sector3_start_m = None, None
         self.packet_state = {}
         self.current_setup = None
-        self.manual_stop_uid = None
+        self.manual_stop_session_key = None
         for key in (
             "setup", "front_wing", "rear_wing", "on_throttle_diff", "off_throttle_diff",
             "lap_number", "current_lap_ms", "lap_distance_m", "invalid",
@@ -352,10 +356,25 @@ class SessionStore:
 
     def record_game_session(self, game: dict[str, Any]) -> None:
         with self.lock:
-            self._observe_uid(int(game["session_uid"]))
-            self.game_session_uid = int(game["session_uid"])
-            self.game_mode = str(game["mode"])
-            self.game_session_type = int(game["session_type"])
+            incoming_uid = int(game["session_uid"])
+            incoming_type = int(game["session_type"])
+            incoming_mode = str(game["mode"])
+            previous_uid, previous_type = self.game_session_uid, self.game_session_type
+            self._observe_uid(incoming_uid)
+            phase_changed = bool(
+                previous_uid == incoming_uid
+                and previous_type is not None
+                and previous_type != incoming_type
+                and incoming_mode in AUTOMATIC_RECORDING_MODES
+                and self.active_recording_id is not None
+                and self.sessions[self.active_recording_id].mode in {"practice", "qualifying"}
+            )
+            if phase_changed:
+                self._close_active("completed")
+                self._reset_lap()
+            self.game_session_uid = incoming_uid
+            self.game_mode = incoming_mode
+            self.game_session_type = incoming_type
             self.track_id = int(game["track_id"])
             self.track_length_m = int(game["track_length_m"])
             self.sector2_start_m = float(game["sector2_start_m"]) if game.get("sector2_start_m") is not None else None
@@ -363,6 +382,7 @@ class SessionStore:
             self.latest.update({
                 "game_session_uid": self.game_session_uid, "game_mode": self.game_mode,
                 "session_type": self.game_session_type, "track_id": self.track_id,
+                "session_type_name": str(game.get("session_type_name") or self.game_mode.replace("_", " ").title()),
                 "track_length_m": self.track_length_m, "track_name": track_name(self.track_id),
             })
             self._touch()
@@ -373,19 +393,21 @@ class SessionStore:
             }
             guarded_tail = self.race_uid_reopen_guard.get(self.game_session_uid, 0) > now
             if (
-                self.game_mode == "race"
+                self.game_mode in AUTOMATIC_RECORDING_MODES
                 and self.active_recording_id is None
-                and self.manual_stop_uid != self.game_session_uid
-                and not guarded_tail
+                and self.manual_stop_session_key != (self.game_session_uid, self.game_session_type)
+                and (self.game_mode != "race" or not guarded_tail)
             ):
-                self._create_recording(f"Race · {track_name(self.track_id)}", "race", automatic=True)
+                session_name = str(game.get("session_type_name") or self.game_mode.replace("_", " ").title())
+                self._create_recording(f"{session_name} · {track_name(self.track_id)}", self.game_mode, automatic=True)
 
     def game_session_ended(self, session_uid: int) -> None:
         with self.lock:
             if self.game_session_uid == session_uid:
                 self._close_active("completed")
                 self._reset_lap()
-                self.manual_stop_uid = session_uid
+                if self.game_session_type is not None:
+                    self.manual_stop_session_key = (session_uid, self.game_session_type)
 
     def _at_lap_start(self) -> bool:
         if self.active_lap_number is None:
@@ -401,12 +423,15 @@ class SessionStore:
         now = datetime.now(timezone.utc)
         session_id = f"session-{now.strftime('%Y%m%dT%H%M%S')}-{uuid4().hex[:8]}"
         at_start = self._at_lap_start()
+        default_name = {"time_trial": "Time Trial run", "practice": "Practice", "qualifying": "Qualifying", "race": "Race"}.get(mode, "Session")
         session = RecordingSession(
-            id=session_id, name=name.strip()[:80] or ("Time Trial run" if mode == "time_trial" else "Race"),
+            id=session_id, name=name.strip()[:80] or default_name,
             mode=mode, started_at=now.isoformat(timespec="seconds").replace("+00:00", "Z"),
             ended_at=None, status="recording" if at_start else "armed",
             game_session_uid=self.game_session_uid, track_id=self.track_id,
             track_length_m=self.track_length_m, lap_ids=[],
+            game_session_type=self.game_session_type,
+            game_session_name=str(self.latest.get("session_type_name") or default_name),
             sector2_start_m=self.sector2_start_m, sector3_start_m=self.sector3_start_m,
             circuit_profile_id=(profile_identity(2025, self.track_id) if self.track_id is not None else None),
             race_store_file="race-data.sqlite3",
@@ -537,8 +562,8 @@ class SessionStore:
             if self.active_recording_id is None:
                 raise SessionStateError("No recording session is active")
             session = self.sessions[self.active_recording_id]
-            if session.mode == "race":
-                self.manual_stop_uid = session.game_session_uid
+            if session.mode in AUTOMATIC_RECORDING_MODES and session.game_session_uid is not None and session.game_session_type is not None:
+                self.manual_stop_session_key = (session.game_session_uid, session.game_session_type)
             self._close_active("stopped")
             self.active_samples = []
             self.active_lap_events = []
@@ -838,9 +863,12 @@ class SessionStore:
             lap_number = int(lap_state["lap_number"])
             if self.active_lap_number is None:
                 packet_session_time = (packet_meta or {}).get("session_time")
-                race_grid_start = bool(
+                session_opening_start = bool(
                     active_session is not None
-                    and active_session.mode == "race"
+                    and (
+                        active_session.mode == "race"
+                        or active_session.game_session_type in ONE_SHOT_SESSION_TYPES
+                    )
                     and active_session.status == "armed"
                     and lap_number == 1
                     and int(lap_state.get("last_lap_ms", 0)) == 0
@@ -848,13 +876,21 @@ class SessionStore:
                     and isinstance(packet_session_time, (int, float))
                     and 0 <= float(packet_session_time) <= 5
                 )
-                self._begin_lap(lap_number, race_grid_start)
-                flags = {"race_grid_start": race_grid_start}
-                if race_grid_start:
+                self._begin_lap(lap_number, session_opening_start)
+                flags = {
+                    "session_opening_start": session_opening_start,
+                    "race_grid_start": session_opening_start and active_session is not None and active_session.mode == "race",
+                    "one_shot_qualifying_start": session_opening_start and active_session is not None and active_session.game_session_type in ONE_SHOT_SESSION_TYPES,
+                }
+                if session_opening_start:
                     active_session.status = "recording"
                     self._persist_session(active_session)
                     decision = "start_capture"
-                    reasons.append("verified_race_grid_start")
+                    reasons.append(
+                        "verified_race_grid_start"
+                        if active_session.mode == "race"
+                        else "verified_one_shot_qualifying_start"
+                    )
                 else:
                     # With no earlier Lap Data there is no proof that this is
                     # the beginning of a full lap. Stay armed until a crossing.
@@ -1383,6 +1419,16 @@ class SessionStore:
         return RaceSessionStore.read_packet_export(path, start_time, end_time)
 
     def snapshot(self) -> dict[str, Any]:
+        result = self.live_snapshot()
+        with self.lock:
+            result["laps"] = [
+                lap.summary(self.notes.get(lap.id, ""))
+                for lap in self.session_laps.get(self.selected_session_id or "", [])
+            ]
+        return result
+
+    def live_snapshot(self) -> dict[str, Any]:
+        """Return only O(1) state needed by the one-second live dashboard poll."""
         with self.lock:
             latest = dict(self.latest)
             latest["connected"] = self.last_packet_at is not None and monotonic() - self.last_packet_at < 3.0
@@ -1393,7 +1439,6 @@ class SessionStore:
                 recording["capturing_lap_number"] = self.active_lap_number if self.capture_current_lap else None
             return {
                 "latest": latest,
-                "laps": [lap.summary(self.notes.get(lap.id, "")) for lap in self.session_laps.get(self.selected_session_id or "", [])],
                 "recording": recording,
                 "selected_session_id": self.selected_session_id,
                 "selected_is_active": bool(active and selected and active.id == selected.id),
@@ -1406,6 +1451,11 @@ class SessionStore:
             if selected not in self.sessions:
                 raise SessionStateError("Unknown session ID")
             return [lap.summary(self.notes.get(lap.id, "")) for lap in self.session_laps[selected]]
+
+    def list_all_laps(self) -> list[dict[str, Any]]:
+        """Return all compact lap summaries in one response for initial cache hydration."""
+        with self.lock:
+            return [lap.summary(self.notes.get(lap.id, "")) for lap in self.laps]
 
     def get_lap_object(self, lap_id: str) -> Lap | None:
         if lap_id.startswith("pb:"):

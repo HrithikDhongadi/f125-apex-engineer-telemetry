@@ -123,6 +123,15 @@ class SessionStoreTests(unittest.TestCase):
         self.assertTrue(any("Race and Time Trial" in warning for warning in comparison["comparison_warnings"]))
         self.assertTrue(any("Candidate is game-invalid" in warning for warning in comparison["comparison_warnings"]))
 
+    def test_practice_and_qualifying_laps_compare_as_exploratory_evidence(self):
+        samples = [sample(index * 100, index * 1_000) for index in range(60)]
+        practice = Lap(2, 90_000, False, samples=samples, saved_at="practice", recording_session_id="p1", mode="practice", track_id=7)
+        qualifying = Lap(3, 89_500, False, samples=samples, saved_at="qualifying", recording_session_id="q1", mode="qualifying", track_id=7)
+        comparison = compare_laps(practice, qualifying)
+        self.assertEqual(comparison["summary"]["final_delta_s"], -0.5)
+        self.assertFalse(comparison["data_quality"]["like_for_like_mode"])
+        self.assertTrue(any("Practice and Qualifying conditions differ" in warning for warning in comparison["comparison_warnings"]))
+
     def test_different_tracks_and_partial_distance_capture_are_rejected(self):
         samples = [sample(0, 0), sample(5891, 90_000)]
         trial = Lap(1, 89_000, False, samples=samples, saved_at="tt", recording_session_id="tt-1", mode="time_trial", track_id=7, track_length_m=5891)

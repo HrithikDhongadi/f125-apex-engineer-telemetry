@@ -1,12 +1,12 @@
 import Konva from "konva";
 
 const COLORS = {
-  trace: "#65e6ad",
-  suggestion: "#ffad5a",
-  label: "#f2f5f8",
-  labelBackground: "#090c12",
+  trace: "#dfe3e8",
+  suggestion: "#ffb020",
+  label: "#f5f5f5",
+  labelBackground: "#08090b",
 };
-const TURN_COLORS = ["#ff8a5b", "#56cfe1", "#c77dff", "#f9c74f", "#90be6d", "#f28482", "#4ea8de", "#f8961e"];
+const TURN_COLORS = ["#e10600", "#43c6e8", "#a978ff", "#ffb020", "#36d996", "#ff6b55", "#45a7ff", "#ff7a18"];
 
 const PAN_SURFACE_SIZE = 100000;
 
@@ -332,12 +332,12 @@ class CircuitProfilerCanvas {
 }
 
 const PACE_COLORS = {
-  candidate: "#27d9ad",
-  baseline: "#f04759",
-  neutral: "#8290a3",
-  bed: "#293445",
-  label: "#f5f7fa",
-  labelBackground: "#080b10",
+  candidate: "#e10600",
+  baseline: "#43c6e8",
+  neutral: "#6f7682",
+  bed: "#2b2f37",
+  label: "#f5f5f5",
+  labelBackground: "#08090b",
 };
 
 class PaceMapCanvas {

@@ -3,6 +3,7 @@ import unittest
 
 from src.f1telemetry.protocol import (
     HEADER_SIZE,
+    SESSION_TYPE_NAMES,
     decode_header,
     decode_player_car_telemetry,
     decode_player_setup,
@@ -67,9 +68,31 @@ class ProtocolTests(unittest.TestCase):
         struct.pack_into("<b", body, 7, 7)
         decoded = decode_session(header + body, decode_header(header + body))
         self.assertEqual(decoded, {
-            "session_uid": 9876, "session_type": 18, "mode": "time_trial",
+            "session_uid": 9876, "session_type": 18, "session_type_name": "Time Trial", "mode": "time_trial",
             "track_id": 7, "track_length_m": 5891,
         })
+
+    def test_official_practice_qualifying_and_shootout_types_are_classified(self):
+        expected = {
+            1: ("practice", "Practice 1"),
+            4: ("practice", "Short Practice"),
+            5: ("qualifying", "Qualifying 1"),
+            9: ("qualifying", "One-Shot Qualifying"),
+            10: ("qualifying", "Sprint Shootout 1"),
+            14: ("qualifying", "One-Shot Sprint Shootout"),
+            15: ("race", "Race"),
+            18: ("time_trial", "Time Trial"),
+        }
+        for session_type, (mode, name) in expected.items():
+            header = struct.pack("<HBBBBBQfIIBB", 2025, 25, 1, 0, 1, 1, 9876, 0, 1, 1, 0, 255)
+            body = bytearray(8)
+            struct.pack_into("<H", body, 4, 5891)
+            body[6] = session_type
+            struct.pack_into("<b", body, 7, 7)
+            decoded = decode_session(header + body, decode_header(header + body))
+            self.assertEqual(decoded["mode"], mode)
+            self.assertEqual(decoded["session_type_name"], name)
+            self.assertEqual(SESSION_TYPE_NAMES[session_type], name)
 
     def test_session_packet_rejects_wrong_format_or_version(self):
         wrong_format = struct.pack("<HBBBBBQfIIBB", 2024, 24, 1, 0, 1, 1, 1, 0, 0, 0, 0, 255) + bytes(8)

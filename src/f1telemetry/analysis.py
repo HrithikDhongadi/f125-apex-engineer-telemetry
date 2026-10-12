@@ -374,9 +374,9 @@ def _window_notes(
 def compare_laps(baseline: Lap, candidate: Lap, circuit_profile: dict[str, Any] | None = None) -> dict[str, Any]:
     both_legacy = baseline.recording_session_id == candidate.recording_session_id == "legacy"
     if not both_legacy:
-        if baseline.mode != candidate.mode:
-            if {baseline.mode, candidate.mode} != {"race", "time_trial"}:
-                raise ComparisonError("Legacy or unknown-mode laps cannot be compared with recorded sessions")
+        supported_modes = {"practice", "qualifying", "race", "time_trial"}
+        if baseline.mode not in supported_modes or candidate.mode not in supported_modes:
+            raise ComparisonError("Legacy or unknown-mode laps cannot be compared with recorded sessions")
         if baseline.track_id is None or candidate.track_id is None or baseline.track_id < 0 or candidate.track_id < 0:
             raise ComparisonError("Both laps need a known track before they can be compared")
         if baseline.track_id != candidate.track_id:
@@ -387,8 +387,6 @@ def compare_laps(baseline: Lap, candidate: Lap, circuit_profile: dict[str, Any] 
             and (circuit_profile is None or circuit_profile.get("verification_status") != "verified")
         ):
             raise ComparisonError("Cross-session race comparison requires the same manually verified circuit profile")
-        if baseline.mode not in {"race", "time_trial"} and baseline.recording_session_id != candidate.recording_session_id:
-            raise ComparisonError("These laps do not have compatible recording modes")
     base_trace, base_quality = aligned_trace(baseline)
     candidate_trace, candidate_quality = aligned_trace(candidate)
     if base_quality != candidate_quality:
@@ -404,7 +402,8 @@ def compare_laps(baseline: Lap, candidate: Lap, circuit_profile: dict[str, Any] 
         warnings.append("Candidate is game-invalid; use its trace for diagnosis only, not as valid-lap or PB evidence.")
     if baseline.mode != candidate.mode:
         warnings.append(
-            "Race and Time Trial conditions differ (fuel, tyres, grip, traffic and rules); the delta is exploratory and is not a like-for-like pace claim."
+            f"{baseline.mode.replace('_', ' ').title()} and {candidate.mode.replace('_', ' ').title()} conditions differ "
+            "(fuel, tyres, grip, traffic and rules); the delta is exploratory and is not a like-for-like pace claim."
         )
     if len(baseline.samples) < 30 or len(candidate.samples) < 30:
         warnings.append("At least one lap has fewer than 30 samples; fine-grained corner and control comparisons may be unreliable.")

@@ -60,6 +60,51 @@ class PersonalBestTests(unittest.TestCase):
             self.assertEqual(len(entry["lap"]["samples"]), len(lap.samples))
             self.assertFalse(list(path.glob("*.tmp")))
 
+    def test_official_history_pb_retains_separate_captured_comparison_trace(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            registry = PersonalBestRegistry(path)
+            captured = complete_lap(105_317, track_id=10, session_id="captured-run")
+            registry.consider(captured, "captured session")
+
+            official = registry.consider_official_history(
+                track_id=10, track_length_m=7007, mode="time_trial",
+                time_ms=104_954, sector1_ms=31_265, sector2_ms=44_967,
+                sector3_ms=28_722, lap_number=9, valid_flags=15,
+                session_id="history-run", session_name="Spa TT",
+                game_session_uid=123,
+            )
+
+            self.assertIsNotNone(official)
+            self.assertEqual(official["time_ms"], 104_954)
+            self.assertEqual(official["sector3_ms"], 28_722)
+            self.assertTrue(official["official_time_only"])
+            self.assertEqual(official["comparison_lap_time_ms"], 105_317)
+            self.assertEqual(official["lap"]["time_ms"], 105_317)
+            self.assertIsNone(official["setup"])
+
+            # A quicker complete trace improves comparison fidelity without
+            # replacing the still-faster official PB time.
+            registry.consider(complete_lap(105_000, track_id=10, session_id="better-trace"), "better trace")
+            current = PersonalBestRegistry(path).get(pb_key(10, "time_trial"))
+            self.assertEqual(current["time_ms"], 104_954)
+            self.assertEqual(current["comparison_lap_time_ms"], 105_000)
+            self.assertEqual(current["lap"]["time_ms"], 105_000)
+
+    def test_invalid_session_history_does_not_replace_pb(self):
+        with TemporaryDirectory() as directory:
+            registry = PersonalBestRegistry(Path(directory))
+            registry.consider(complete_lap(105_317, track_id=10), "captured")
+            result = registry.consider_official_history(
+                track_id=10, track_length_m=7007, mode="time_trial",
+                time_ms=104_000, sector1_ms=31_000, sector2_ms=44_000,
+                sector3_ms=29_000, lap_number=9, valid_flags=7,
+                session_id="history-run", session_name="Spa TT",
+                game_session_uid=123,
+            )
+            self.assertIsNone(result)
+            self.assertEqual(registry.get(pb_key(10, "time_trial"))["time_ms"], 105_317)
+
     def test_historical_rebuild_and_compatible_pb_comparison(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))

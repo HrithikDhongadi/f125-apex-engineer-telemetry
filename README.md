@@ -37,7 +37,9 @@ If port `8025` is already in use, an earlier copy is probably running. Open the 
 
 The decoder follows EA's **F1 25 UDP specification v3**, validates format `2025`, and checks the packet-specific version before applying offsets. Unsupported versions are ignored rather than decoded with guessed layouts. Session type `18` is treated as Time Trial; types `15–17` are races. Track identity comes from the game rather than being assumed. The complete documented track-ID appendix is built in: Silverstone is ID `7`, while its reverse layout is the independent ID `39` (Austria/Zandvoort reverse are `40`/`41`). Unrecognised IDs appear as `Unknown track (ID n)`.
 
-The continuous store decodes Motion (0), Session (1), Lap Data (2), Event (3), Participants (4), Setups (5), Car Telemetry (6), Car Status (7), Final Classification (8), Car Damage (10), Session History (11), Tyre Sets (12), Motion Ex (13), and Lap Positions (15). Every stored row retains the session UID, packet ID/version, both frame identifiers, session/receive time, player index, and available lap distance. Same-frame rows can be joined by overall frame ID; slower packets carry their own timestamp and freshness interval.
+The continuous store decodes Motion (0), Session (1), Lap Data (2), Event (3), Participants (4), Setups (5), Car Telemetry (6), Car Status (7), Final Classification (8), Car Damage (10), Session History (11), Tyre Sets (12), Motion Ex (13), and Lap Positions (15). Every stored row retains the session UID, packet ID/version, both frame identifiers, session/receive time, player index, and available lap distance. Same-frame rows can be joined by overall frame ID; slower packets carry their own timestamp and freshness interval. Schema v2 stores decoded headers and payloads as level-1 zlib JSON BLOBs; readers transparently support both the original text rows and compressed rows, so report/export behaviour is unchanged while new recordings use substantially less disk space.
+
+Closed schema-v1 databases can be converted atomically with `python3 utils/migrate_race_store.py <session-id>`. The migrator builds a separate database, preserves packet/timeline sequence numbers and metadata, then verifies SQLite integrity, row counts, and a SHA-256 of every logical decoded header/payload before replacement. By default it retains the original as an `.uncompressed-<timestamp>.bak` file; add `--discard-original` only when that verified fallback is no longer required and disk space should be reclaimed. Never migrate an active recording.
 
 Packet ID `5` is decoded using the complete packed 50-byte `CarSetupData` stride. Setup snapshots include aero, both differential settings, signed camber/toe floats, suspension, anti-roll bars, ride heights, brakes, engine braking, the four configured tyre pressures with explicit wheel names, ballast, and fuel load. These pressures are setup values and are never substituted with measured Car Telemetry pressures. Older four-field files remain valid; all absent settings display as `unknown`.
 
@@ -70,7 +72,9 @@ Race types start a recording automatically. The first lap is captured directly f
 
 At the finish, F1 25 can briefly report another session UID and then send one final packet bundle under the completed race UID. Apex Engineer guards that completed UID for five seconds so the trailing bundle cannot create an empty duplicate race; a genuinely new UID remains eligible for immediate automatic recording.
 
-Race packet data is committed continuously to `race-data.sqlite3` in WAL mode. Grid time, incomplete laps, pit-lane running, safety-car periods and the finish therefore survive without waiting for a completed lap. On restart, an open `session.json` is marked `interrupted`, while the already committed database remains readable. The database is capped at 8 GiB per recording so a 60 Hz full race has room while disk growth remains bounded. Continuity is calculated separately for Motion, Lap Data, Car Telemetry, Car Status and Motion Ex; lower-rate streams are excluded and gaps shared by several streams are never added together. Each stream reports received/unique frames, duplicates, out-of-order frames, gap events, largest gaps and effective receive rate. A game-ID/session-time jump with no matching recorder wall-time gap is labelled `sequence_discontinuity`, not UDP loss; only wall-clock-supported gaps are labelled `capture_loss`.
+Race packet data is committed continuously to `race-data.sqlite3` in WAL mode. The first packets commit immediately; sustained packet bursts use bounded batches of at most 128 packets or 250 ms, and every completed lap is an explicit durability boundary. This avoids a separate SQLite transaction for every UDP datagram while limiting the tail exposed by an abrupt process or power failure. Grid time, incomplete laps, pit-lane running, safety-car periods and the finish therefore survive without waiting for the whole session to end. On restart, an open `session.json` is marked `interrupted`, while the already committed database remains readable. The database is capped at 8 GiB per recording so a 60 Hz full race has room while disk growth remains bounded. Continuity is calculated separately for Motion, Lap Data, Car Telemetry, Car Status and Motion Ex; lower-rate streams are excluded and gaps shared by several streams are never added together. Each stream reports received/unique frames, duplicates, out-of-order frames, gap events, largest gaps and effective receive rate. A game-ID/session-time jump with no matching recorder wall-time gap is labelled `sequence_discontinuity`, not UDP loss; only wall-clock-supported gaps are labelled `capture_loss`.
+
+Live dashboard polling uses incremental counters and a bounded in-memory event view. It never scans the growing packet database or performs final flashback reconstruction while recording. Exact continuity, event attribution and branch reconstruction run when a closed-session report or export is requested. During recording, timeline events are visibly marked `pending`; closing the session replaces that provisional view with accepted/superseded reconstruction. Historical lap lists are cached in the browser, so periodic refreshes fetch only the displayed and active sessions instead of every saved session.
 
 F1 session UIDs are unsigned 64-bit values. Values above SQLite's signed integer maximum are stored using their equivalent signed 64-bit bit pattern; packet header JSON and exports retain the exact original unsigned value. Unexpected decoding or persistence errors are shown in the dashboard and contained so one packet cannot silently terminate the UDP receiver.
 
@@ -90,6 +94,8 @@ Sessions can be renamed without changing their IDs or lap files. A closed sessio
 
 The Session page shows the circuit profile currently assigned to the selected session and links directly to the Circuit Profiler. Loading a saved profile restores its stored centreline and turn definitions for further editing. Deleting a user-created profile moves it to `data/trash/circuit_profiles/` and clears session references to it; the built-in Silverstone seed cannot be deleted.
 
+The **Circuit Stats** page combines laps from every saved session that shares the same numeric track ID. Its default ranking is best-to-worst with ten laps per page. Filters cover mode, game validity, session, year, tyre compound, setup completeness, telemetry coverage, free-text notes and alternate ordering. Summary cards show the best and theoretical-best laps, average and median pace, consistency, valid/invalid totals, session count, first-to-latest trend and peak speed. A separate race section groups captured race laps by session and reports clean-lap rate, pace consistency, average finish and wins, pit stops, penalty/warning counters, fuel use, tyre-wear change and compounds. Finishing statistics prefer the player's Final Classification row. If that packet is unavailable, the last-lap position is accepted only when a completed recording reached the game-advertised total lap count; stopped and incomplete races remain unknown. A ranked lap can be opened in its Session or assigned directly as a Lap Analysis baseline/candidate. Track IDs remain the compatibility identity, so reverse layouts and manual display-name overrides are never merged.
+
 Storage layout:
 
 ```text
@@ -97,7 +103,7 @@ data/
   lap-*.json                         Existing v0.1/v0.2 files, unchanged
   notes.json                         Per-lap notes, when used
   personal_bests/
-    track-<id>__<mode>.json          Atomic full-fidelity winning-lap copies
+    track-<id>__<mode>.json          Atomic official PB plus optional captured trace
   audit/setup-amendments/<lap>/<id>/ Exact original lap/PB and amendment manifest
   sessions/
     session-<timestamp>-<suffix>/
@@ -125,7 +131,7 @@ Configured setup tyre pressures and measured running pressures are deliberately 
 Reports explicitly separate recorded official lap/result fields, raw UDP notifications, accepted-timeline reconstruction, and inferred engineering observations. Processing-version lines identify the decoder, timeline reconstruction, event attribution, continuity analysis and report format used. Regenerate a historical report from immutable stored data with:
 
 ```bash
-python3 scripts/reprocess_session.py session-20261008T090243-5dd3a5b6 data/reports/spa-race-corrected.md --report-type race
+python3 utils/reprocess_session.py session-20261008T090243-5dd3a5b6 data/reports/spa-race-corrected.md --report-type race
 ```
 
 The regenerated timeline JSON in a full ZIP retains packet/frame provenance and discarded-branch evidence; the readable Markdown does not dump repetitive raw events.
@@ -134,7 +140,7 @@ Use **Edit/Add setup** on a saved lap to enter a historical setup from the game 
 
 ## Personal best registry
 
-Every newly completed lap is evaluated automatically. A PB update requires:
+Every newly completed lap is evaluated automatically. A full-trace PB update requires:
 
 - a valid official lap of at least 30 seconds;
 - a known track ID and compatible `race` or `time_trial` mode;
@@ -143,7 +149,9 @@ Every newly completed lap is evaluated automatically. A PB update requires:
 
 Slower, invalid, partial, legacy-distance, and unknown-track laps cannot replace a PB. Keys include actual track ID and mode, so race and Time Trial records are not mixed.
 
-Each PB file is an independent full copy of the winning lap: all telemetry samples and units, official times and sectors, setup snapshot, source IDs/session name, note/provenance, data-quality result, and the date it became PB. Updates use a temporary file plus atomic replacement and never mutate the source lap. Use **Rebuild from saved sessions** deliberately to consider historical session laps. A stored compatible PB can be selected independently as either baseline or candidate.
+Time Trial Session History packets are also checked for player laps whose game validity flags confirm the lap and all three sectors. This preserves an official PB when the finish-line packet or full trace was missed. Such a record is explicitly marked `official_time_only`: its official time, three sectors, lap number, validity flags and game-session provenance are stored, while unavailable telemetry and setup remain unavailable. The fastest eligible complete captured lap is retained separately as the comparison trace; its slower trace time is never presented as the official PB's telemetry.
+
+Each normal PB file is an independent full copy of the winning lap: all telemetry samples and units, official times and sectors, setup snapshot, source IDs/session name, note/provenance, data-quality result, and the date it became PB. Updates use a temporary file plus atomic replacement and never mutate the source lap. Use **Rebuild from saved sessions** deliberately to consider both historical lap files and the latest player Session History stored in each Time Trial database. A stored PB with a captured trace can be selected independently as either baseline or candidate; a timing-only PB remains visible but cannot be used as a trace.
 
 Back up `data/personal_bests/` together with `data/sessions/`. PB copies remain usable for comparison even if their original session is later unavailable.
 

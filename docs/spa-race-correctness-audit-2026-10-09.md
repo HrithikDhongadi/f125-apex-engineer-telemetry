@@ -29,7 +29,7 @@ The correction is deliberately a read-time reconstruction over the immutable pac
 | Warning reported as penalty | Report counted every player PENA packet as a penalty. Official F1 25 type 5 means Warning; infringement 4 means Small Collision. Lap Data changes warnings 0→1 while penalty seconds remain 0→0. | High | High | Decode notification class separately; report warnings, infringement notifications, actual-penalty-type notifications, final time-penalty counter, drive-throughs, stop-go events, and superseded notifications. |
 | Collision count treated as incidents | Every player COLL message was described as a collision count, without branch validity or repeat grouping. One of 11 player messages is on the abandoned branch. | High | High for accepted messages; medium for physical incidents | Preserve raw messages, exclude the superseded message from final statistics, and conservatively group accepted messages only when pair/branch/time/location agree. |
 | Lap 1 stale setup | The recorder froze the first setup too early. Frames 0/30/60 contain the 10 kg provisional setup; frame 90 changes to the 17 kg setup before start light 2, then repeats unchanged for 1,141 setup packets. | High | High | Audit full Packet 5 history. Keep the stored Lap 1 snapshot visible as superseded and use the repeated selection as reconstructed active context without rewriting lap JSON. |
-| 0/0 race wings suspicious | All 1,144 race Packet 5 player records decode 0/0, while later TT data decodes non-zero wings. This is not a byte-offset-only failure. | Medium | High that 0/0 was transmitted; low on why | Retain 0/0 exactly and label verification `unverified_as_transmitted_zero`; do not substitute guessed values. |
+| 0/0 race wings initially suspicious | All 1,144 race Packet 5 player records decode 0/0, while later TT data decodes non-zero wings. The driver confirmed on 2026-10-10 that 0/0 was the actual race setup. | Resolved | High | Retain 0/0 exactly as transmitted and record the driver confirmation; no decoder correction is required. |
 | Frame gaps labelled packet loss | The old report summed unlike streams; the newer calculation fixed that but still named every ID jump “missing.” Largest gaps are simultaneous across all 60 Hz streams and game/session clocks jump 0.5–0.65 s while recorder wall time advances only 1–3 ms. | Medium | High | Report per-stream received/unique/duplicate/out-of-order frames and classify gaps. This recording has 164 worst-stream sequence-gap frames, 164 classified sequence discontinuities, and zero wall-clock-supported capture-loss frames. |
 | Profile “verified” overstates calibration | A global label coexists with unverified individual turns, draft names, estimated apexes and overlapping windows. | Medium | High | Expose separate track identity, game-measured length, turn-label, boundary, and apex-calibration states. Keep corner analysis exploratory and deltas non-additive. |
 | Corner analysis described where, not why | Existing windows provided delta/minimum speed but omitted several input/vehicle-state comparisons. | Medium | High | Add entry speed, brake onset/peak/release, gear, turn-in, apex/minimum/exit speed, throttle pickup/full-throttle, brake-throttle overlap, steering-correction indicator, lateral/longitudinal acceleration when present, rear slip and ERS when present. Avoid causal balance diagnoses. |
@@ -61,7 +61,7 @@ The recorder's completed lap remains valid because its per-lap sample path alrea
 
 Both setup variants are Packet 5 records for player car index 19. The setup changes at frame 90 while session time is still 0.000 s; start light 1 was at frame 48, start light 2 at frame 95, and lights out at frame 329. The second setup then remains stable through the race. That makes the first variant provisional/superseded with high confidence.
 
-The stored 0/0 wings cannot be externally confirmed from this dataset. They remain visible exactly as transmitted. Configured starting fuel remains distinct from instantaneous Car Status fuel.
+The stored 0/0 wings are consistent across all 1,144 player setup packets, and the driver confirmed on 2026-10-10 that 0/0 was the actual race setup. This resolves the suspected wing-decoder issue for this recording. Configured starting fuel remains distinct from instantaneous Car Status fuel.
 
 ## Continuity evidence
 
@@ -84,13 +84,13 @@ The full suite passes 96 tests. Added coverage verifies:
 
 Existing regressions continue to cover normal race capture, standing-grid lap 1, session restart/UID isolation, race completion duplication, TT invalid-lap preservation/PB exclusion, Restart Lap, mid-lap and boundary flashbacks, historical setup compatibility, overlapping profile windows, and uncertainty for unavailable data.
 
-Secondary raw-session validation also succeeded. Spa TT 1 contains five near-full-distance laps, preserves invalid lap 1, and retains its transmitted 0/0 wing setup. Spa TT 4 contains seven near-full-distance laps, preserves invalid laps 13/14/16, and consistently decodes the non-zero 6/2 wing setup. This supports the conclusion that the setup decoder can read non-zero wings and that the race's persistent 0/0 values must be treated as transmitted-but-unverified rather than “fixed” by changing offsets.
+Secondary raw-session validation also succeeded. Spa TT 1 contains five near-full-distance laps, preserves invalid lap 1, and retains its transmitted 0/0 wing setup. Spa TT 4 contains seven near-full-distance laps, preserves invalid laps 13/14/16, and consistently decodes the non-zero 6/2 wing setup. Together with the driver's confirmation of the race setup, this supports the decoder: it preserves genuine 0/0 values and correctly reads non-zero 6/2 values without changing offsets.
 
 Checks executed:
 
 ```text
 python3 -m unittest discover -s tests -v  -> 96 passed
-python3 -m py_compile src/f1telemetry/*.py scripts/reprocess_session.py -> passed
+python3 -m py_compile src/f1telemetry/*.py utils/reprocess_session.py -> passed
 npm run check:frontend -> passed
 ```
 
@@ -98,7 +98,7 @@ npm run check:frontend -> passed
 
 - No Packet Final Classification (ID 8) exists in the primary database, so P14→P9 is supported by accepted lap-position snapshots rather than a stored post-race classification packet.
 - Physical collision incident identity cannot be proven from COLL alone. The report exposes the grouping rule and both counts.
-- The 0/0 wing values cannot be validated against a setup screenshot; changing them would fabricate data.
+- The 0/0 wing values are driver-confirmed for this race; that confirmation is external evidence rather than information encoded in the UDP packet itself.
 - Historical event rows require deterministic correlation back to packet rows. All primary Spa key events correlate; uncorrelated rows are explicitly `unknown`.
 - The Spa turn profile is not ready for authoritative corner coaching. Track identity and game length are supported, but individual names/directions/boundaries/apexes need in-game trace calibration. Overlapping windows cannot be summed.
 - Older lap JSON lacks per-sample ERS and some state channels even where slower raw packets exist. The report leaves unsupported corner metrics unavailable rather than interpolating them without a defined correlation method.

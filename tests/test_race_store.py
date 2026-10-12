@@ -4,11 +4,13 @@ import sqlite3
 from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+import zlib
 from zipfile import ZipFile
 from io import BytesIO
 
 from src.f1telemetry.circuit_profiles import CircuitProfileError, CircuitProfileStore, profile_audit, profile_identity
-from src.f1telemetry.race_store import RaceSessionStore
+from src.f1telemetry.race_store import RaceSessionStore, migrate_packet_storage
 from src.f1telemetry.receiver import SessionStore
 
 
@@ -45,6 +47,147 @@ def udp_event(store, frame: int, overall: int, session_time: float, payload: dic
 
 
 class RaceStoreTests(unittest.TestCase):
+    def test_player_final_classification_is_read_from_official_packet(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "race.sqlite3"
+            store = RaceSessionStore(path)
+            header = packet(50, packet_id=8)
+            store.append_packet(header, {"cars": [
+                {"car_index": 0, "position": 1, "grid_position": 10, "laps": 5, "pit_stops": 1, "penalties_s": 2},
+                {"car_index": 1, "position": 2, "grid_position": 1, "laps": 5, "pit_stops": 0, "penalties_s": 0},
+            ]})
+            store.flush()
+            result = RaceSessionStore.read_player_final_classification(path)
+            store.close()
+            self.assertEqual(result["position"], 1)
+            self.assertEqual(result["grid_position"], 10)
+            self.assertEqual(result["pit_stops"], 1)
+
+    def test_legacy_plain_json_store_migrates_atomically_without_logical_changes(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "race.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript("""
+                CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE packets(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,received_at TEXT NOT NULL,
+                    session_uid INTEGER NOT NULL,session_time REAL NOT NULL,
+                    frame_identifier INTEGER NOT NULL,overall_frame_identifier INTEGER NOT NULL,
+                    packet_id INTEGER NOT NULL,packet_version INTEGER NOT NULL,
+                    player_car_index INTEGER NOT NULL,header_json TEXT NOT NULL DEFAULT '{}',
+                    game_lap_distance REAL,freshness_ms REAL,payload_json TEXT NOT NULL);
+                CREATE TABLE timeline(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,received_at TEXT NOT NULL,
+                    session_time REAL NOT NULL,lap_number INTEGER,event_type TEXT NOT NULL,
+                    source TEXT NOT NULL,details_json TEXT NOT NULL);
+                CREATE INDEX packets_frame ON packets(overall_frame_identifier,packet_id);
+                CREATE INDEX packets_time ON packets(session_time,sequence);
+                CREATE INDEX timeline_time ON timeline(session_time,sequence);
+            """)
+            header = json.dumps({"packet_format": 2025, "session_uid": 7}, separators=(",", ":"))
+            payload = json.dumps({"player": {"lap_distance_m": 10}, "cars": [{"position": 1}] * 22}, separators=(",", ":"))
+            for frame in range(1, 101):
+                connection.execute(
+                    "INSERT INTO packets(received_at,session_uid,session_time,frame_identifier,overall_frame_identifier,packet_id,packet_version,player_car_index,header_json,game_lap_distance,freshness_ms,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ("2026-01-01T00:00:00Z", 7, frame / 60, frame, frame, 2, 1, 0, header, 10.0, 16.7, payload),
+                )
+            connection.execute(
+                "INSERT INTO timeline(received_at,session_time,lap_number,event_type,source,details_json) VALUES(?,?,?,?,?,?)",
+                ("2026-01-01T00:00:00Z", 1.0, 1, "recording_started", "recorder", "{}"),
+            )
+            connection.commit()
+            connection.close()
+
+            before_export = RaceSessionStore.read_packet_export(path, 0, 10)
+            result = migrate_packet_storage(path, keep_backup=True)
+            after_export = RaceSessionStore.read_packet_export(path, 0, 10)
+
+            self.assertEqual(before_export, after_export)
+            self.assertEqual(result["packet_count"], 100)
+            self.assertEqual(result["event_count"], 1)
+            self.assertEqual(result["integrity_check"], "ok")
+            self.assertLess(result["after_bytes"], result["before_bytes"])
+            self.assertTrue(Path(result["backup"]).exists())
+            migrated = sqlite3.connect(path)
+            text, blob = migrated.execute(
+                "SELECT payload_json,payload_json_zlib FROM packets LIMIT 1"
+            ).fetchone()
+            metadata = dict(migrated.execute("SELECT key,value FROM metadata"))
+            migrated.close()
+            self.assertEqual(text, "")
+            self.assertEqual(json.loads(zlib.decompress(blob)), json.loads(payload))
+            self.assertEqual(metadata["packet_json_encoding"], "zlib-json-v1")
+
+    def test_earliest_store_without_header_json_migrates_with_empty_logical_header(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "race.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript("""
+                CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE packets(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,received_at TEXT NOT NULL,
+                    session_uid INTEGER NOT NULL,session_time REAL NOT NULL,
+                    frame_identifier INTEGER NOT NULL,overall_frame_identifier INTEGER NOT NULL,
+                    packet_id INTEGER NOT NULL,packet_version INTEGER NOT NULL,
+                    player_car_index INTEGER NOT NULL,game_lap_distance REAL,
+                    freshness_ms REAL,payload_json TEXT NOT NULL);
+                CREATE TABLE timeline(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,received_at TEXT NOT NULL,
+                    session_time REAL NOT NULL,lap_number INTEGER,event_type TEXT NOT NULL,
+                    source TEXT NOT NULL,details_json TEXT NOT NULL);
+            """)
+            payload = json.dumps({"player": {"lap_number": 4, "lap_distance_m": 321.5}}, separators=(",", ":"))
+            connection.execute(
+                "INSERT INTO packets(received_at,session_uid,session_time,frame_identifier,overall_frame_identifier,packet_id,packet_version,player_car_index,game_lap_distance,freshness_ms,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("2026-01-01T00:00:00Z", 7, 12.5, 10, 10, 2, 1, 0, 321.5, 16.7, payload),
+            )
+            connection.commit()
+            connection.close()
+
+            before_export = RaceSessionStore.read_packet_export(path, 0, 20)
+            result = migrate_packet_storage(path, keep_backup=False)
+            after_export = RaceSessionStore.read_packet_export(path, 0, 20)
+
+            self.assertEqual(before_export, after_export)
+            exported = json.loads(after_export.splitlines()[0])
+            self.assertEqual(exported["header"], {})
+            self.assertEqual(result["packet_count"], 1)
+            self.assertIsNone(result["backup"])
+
+    def test_live_summary_is_constant_time_and_packet_batches_have_bounded_durability(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "race.sqlite3"
+            store = RaceSessionStore(path)
+            for frame in range(1, 18):
+                store.append_packet(packet(frame), {"player": {"lap_distance_m": frame}}, frame)
+
+            # The warm-up is immediately durable; the active burst is made
+            # durable explicitly and automatically at its short batch bound.
+            reader = sqlite3.connect(path)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM packets").fetchone()[0], 16)
+            reader.close()
+            with patch("src.f1telemetry.race_store._summary_query", side_effect=AssertionError("full scan")):
+                live = store.live_summary()
+            self.assertEqual(live["packet_count"], 17)
+            self.assertTrue(live["continuity_pending"])
+            store.flush()
+            reader = sqlite3.connect(path)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM packets").fetchone()[0], 17)
+            reader.close()
+            store.close()
+
+    def test_live_timeline_is_bounded_and_does_not_run_branch_reconstruction(self):
+        with TemporaryDirectory() as directory:
+            store = RaceSessionStore(Path(directory) / "race.sqlite3")
+            store.append_packet(packet(1), {})
+            store.append_event(1.0, "lights_out", {}, "udp_event", 1)
+            with patch("src.f1telemetry.race_store._timeline_query", side_effect=AssertionError("full reconstruction")):
+                events = store.live_timeline()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event_validity"], "pending")
+            self.assertIn("after recording closes", events[0]["validation_reason"])
+            store.close()
+
     def test_unsigned_64_bit_session_uid_is_stored_losslessly(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "race.sqlite3"
@@ -53,12 +196,13 @@ class RaceStoreTests(unittest.TestCase):
             store.append_packet(packet(1, session_uid=uid), {"player": {"lap_number": 1}})
 
             connection = sqlite3.connect(path)
-            stored_uid, header_json = connection.execute(
-                "SELECT session_uid,header_json FROM packets"
+            stored_uid, header_json, header_zlib = connection.execute(
+                "SELECT session_uid,header_json,header_json_zlib FROM packets"
             ).fetchone()
             connection.close()
             self.assertEqual(stored_uid, uid - (1 << 64))
-            self.assertEqual(json.loads(header_json)["session_uid"], uid)
+            self.assertEqual(header_json, "")
+            self.assertEqual(json.loads(zlib.decompress(header_zlib))["session_uid"], uid)
             exported = json.loads(store.export_packets(0, 2).decode("utf-8"))
             self.assertEqual(exported["header"]["session_uid"], uid)
             store.close()
@@ -75,8 +219,11 @@ class RaceStoreTests(unittest.TestCase):
             # A second process can read committed rows before graceful close.
             reader = sqlite3.connect(path)
             self.assertEqual(reader.execute("SELECT COUNT(*) FROM packets").fetchone()[0], 2)
-            header_payload = reader.execute("SELECT header_json FROM packets ORDER BY sequence LIMIT 1").fetchone()[0]
-            self.assertIn('"packet_format":2025', header_payload)
+            header_text, header_blob = reader.execute(
+                "SELECT header_json,header_json_zlib FROM packets ORDER BY sequence LIMIT 1"
+            ).fetchone()
+            self.assertEqual(header_text, "")
+            self.assertIn('"packet_format":2025', zlib.decompress(header_blob).decode("utf-8"))
             reader.close()
             self.assertEqual(store.summary()["missing_frame_estimate"], 1)
             self.assertEqual([item["type"] for item in store.timeline()], ["lights_out", "position_change"])

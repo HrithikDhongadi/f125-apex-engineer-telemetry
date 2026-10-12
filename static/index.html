@@ -15,10 +15,11 @@
       <nav class="tabs" aria-label="Dashboard views">
         <button class="active" data-view="live" aria-keyshortcuts="1">Live</button>
         <button data-view="analysis" aria-keyshortcuts="2">Lap Analysis</button>
-        <button data-view="session" aria-keyshortcuts="3">Session</button>
-        <button data-view="circuit-profiler" aria-keyshortcuts="4">Circuit Profiler</button>
-        <button data-view="settings" aria-keyshortcuts="5">Settings</button>
-        <span class="global-shortcuts">Keys 1–5: pages · Esc: cancel</span>
+        <button data-view="circuit-stats" aria-keyshortcuts="3">Circuit Stats</button>
+        <button data-view="session" aria-keyshortcuts="4">Session</button>
+        <button data-view="circuit-profiler" aria-keyshortcuts="5">Circuit Profiler</button>
+        <button data-view="settings" aria-keyshortcuts="6">Settings</button>
+        <span class="global-shortcuts">Keys 1–6: pages · Esc: cancel</span>
       </nav>
       <section class="panel recorder" aria-label="Recording session controls">
         <div class="recorder-status">
@@ -65,7 +66,7 @@
 
       <section id="view-analysis" class="view">
         <article class="panel pb-panel">
-          <div class="panel-heading"><div><h2>Personal best registry</h2><p class="hint">Full-fidelity valid laps, stored independently from their source sessions.</p></div><button id="rebuild-pbs">Rebuild from saved sessions</button></div>
+          <div class="panel-heading"><div><h2>Personal best registry</h2><p class="hint">Official valid times are preserved independently; complete captured traces remain separately available for comparison.</p></div><button id="rebuild-pbs">Rebuild from saved sessions</button></div>
           <p id="pb-message" class="notice"></p><div id="pb-cards" class="pb-cards"></div><pre id="pb-details" class="pb-details" hidden></pre>
         </article>
         <article class="panel compare-controls">
@@ -95,6 +96,39 @@
           <article class="panel"><div class="panel-heading"><h2>Engineer Notes</h2><span class="hint">Trace evidence only</span></div><p id="calibration" class="notice"></p><div id="engineer-notes" class="notes-grid"></div></article>
         </div>
         <article id="analysis-empty" class="panel empty-state">Select two laps from the same circuit. Invalid and Race/Time Trial comparisons are allowed for exploratory analysis and are clearly warned.</article>
+      </section>
+
+      <section id="view-circuit-stats" class="view">
+        <article class="panel circuit-stats-intro">
+          <div class="panel-heading"><div><h2>Circuit statistics</h2><p class="hint">Explore every recorded lap for one numeric F1 25 track identity. Reverse layouts remain separate circuits.</p></div><span id="circuit-stats-count" class="profile-pill">0 matching laps</span></div>
+          <div class="circuit-stats-filters">
+            <label>Circuit<select id="stats-track"></select></label>
+            <label>Mode<select id="stats-mode"><option value="all">Race + Time Trial</option><option value="race">Race</option><option value="time_trial">Time Trial</option></select></label>
+            <label>Validity<select id="stats-validity"><option value="valid">Valid laps</option><option value="all">All laps</option><option value="invalid">Invalid only</option></select></label>
+            <label>Session<select id="stats-session"><option value="all">All sessions</option></select></label>
+            <label>Year<select id="stats-year"><option value="all">All years</option></select></label>
+            <label>Tyre compound<select id="stats-compound"><option value="all">All compounds</option></select></label>
+            <label>Setup data<select id="stats-setup"><option value="all">Any setup</option><option value="complete">Complete setup</option><option value="partial">Partial setup</option><option value="missing">Missing setup</option></select></label>
+            <label>Trace quality<select id="stats-quality"><option value="all">Any trace quality</option><option value="ready">Analysis ready</option><option value="limited">Limited coverage</option></select></label>
+            <label>Order<select id="stats-order"><option value="best">Best to worst</option><option value="worst">Worst to best</option><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label>
+            <label class="stats-search">Search<input id="stats-search" type="search" placeholder="Session, note or lap number"></label>
+            <button id="stats-reset" type="button">Reset filters</button>
+          </div>
+        </article>
+
+        <div id="circuit-stats-summary" class="circuit-summary-grid"></div>
+
+        <article class="panel race-stats-panel">
+          <div class="panel-heading"><div><h2>Race statistics</h2><p class="hint">Average finish and wins prefer the official Final Classification packet. If unavailable, a finish-line result is accepted only when a completed recording reaches the game’s advertised final lap.</p></div><span id="race-stats-count" class="profile-pill">0 races</span></div>
+          <div id="race-stats-summary" class="race-summary-grid"></div>
+          <div class="table-scroll"><table class="race-stats-table"><thead><tr><th>Race</th><th>Laps captured</th><th>Best / average</th><th>Consistency</th><th>Official finish</th><th>Pit stops</th><th>Penalties / warnings</th><th>Fuel used</th><th>Tyre wear</th><th>Compounds</th><th>Open</th></tr></thead><tbody id="race-stats-sessions"></tbody></table></div>
+        </article>
+
+        <article class="panel table-panel circuit-laps-panel">
+          <div class="panel-heading"><div><h2>Lap ranking</h2><p class="hint">Ten laps per page. Timing uses the official saved lap time; invalid laps are visibly marked.</p></div><span id="stats-page-status" class="hint"></span></div>
+          <div class="table-scroll"><table class="circuit-stats-table"><thead><tr><th>Rank</th><th>Lap time</th><th>Sectors 1 / 2 / 3</th><th>Session</th><th>Mode / validity</th><th>Tyres</th><th>Setup</th><th>Trace / speed</th><th>Open</th></tr></thead><tbody id="circuit-stats-laps"></tbody></table></div>
+          <div class="stats-pagination"><button id="stats-prev" type="button">← Previous</button><span id="stats-pagination-label">Page 1 of 1</span><button id="stats-next" type="button">Next →</button></div>
+        </article>
       </section>
 
       <section id="view-session" class="view">

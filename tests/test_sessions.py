@@ -2,11 +2,12 @@ import json
 from pathlib import Path
 import struct
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from src.f1telemetry.circuit_profiles import CircuitProfileError
-from src.f1telemetry.receiver import LEGACY_SESSION_ID, SessionStore, UdpReceiver
+from src.f1telemetry.receiver import LEGACY_SESSION_ID, Lap, SessionStore, UdpReceiver
 
 
 UID = 1001
@@ -45,6 +46,81 @@ def fill_lap(store, uid, number, time_ms=90_000):
 
 
 class RecordingSessionTests(unittest.TestCase):
+    def test_lap_summary_exposes_compact_circuit_statistics_context(self):
+        lap = Lap(
+            4, 90_000, False, saved_at="context", mode="race", track_id=10,
+            race_context={
+                "start": {
+                    "session": {"weather": 1, "track_temperature_c": 31, "air_temperature_c": 22, "total_laps": 5},
+                    "lap": {"position": 7, "grid_position": 10, "pit_stops": 0, "penalties_s": 2, "warnings": 1},
+                    "car_status": {"actual_tyre_compound": 17, "visual_tyre_compound": 16, "tyre_age_laps": 3, "fuel_kg": 12.5},
+                    "damage": {"tyre_wear_pct": [4.0, 5.0, 6.0, 7.0]},
+                },
+                "finish": {
+                    "lap": {"position": 5, "pit_stops": 1, "penalties_s": 2, "warnings": 2},
+                    "car_status": {"fuel_kg": 10.7},
+                    "damage": {"tyre_wear_pct": [7.0, 8.0, 9.0, 10.0]},
+                },
+            },
+        )
+        summary = lap.summary()
+        self.assertEqual(summary["actual_tyre_compound"], 17)
+        self.assertEqual(summary["tyre_age_laps"], 3)
+        self.assertEqual(summary["start_fuel_kg"], 12.5)
+        self.assertEqual(summary["finish_position"], 5)
+        self.assertEqual(summary["grid_position"], 10)
+        self.assertEqual(summary["finish_pit_stops"], 1)
+        self.assertEqual(summary["finish_penalties_s"], 2)
+        self.assertEqual(summary["finish_warnings"], 2)
+        self.assertEqual(summary["race_total_laps"], 5)
+        self.assertEqual(summary["finish_tyre_wear_pct"], [7.0, 8.0, 9.0, 10.0])
+
+    def test_player_session_history_preserves_valid_time_trial_pb_without_trace(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(track_id=10, track_length=7007))
+            store.record_lap_state(lap_state(9, 60_000, 4_000), UID)
+            run = store.start_time_trial_run("Spa timing recovery")
+            header = SimpleNamespace(
+                packet_format=2025, game_year=25, game_major_version=1, game_minor_version=0,
+                session_uid=UID, session_time=100.0, frame_identifier=6000,
+                overall_frame_identifier=6000, packet_id=11, packet_version=1,
+                player_car_index=0, secondary_player_car_index=255,
+            )
+            store.record_full_packet(header, {
+                "car_index": 0,
+                "laps": [{
+                    "lap_number": 9, "lap_time_ms": 104_954,
+                    "sector1_ms": 31_265, "sector2_ms": 44_967,
+                    "sector3_ms": 28_722, "valid_flags": 15,
+                }],
+                "stints": [], "best_lap_number": 9,
+            })
+
+            pb = store.personal_best("track-10__time_trial")
+            self.assertEqual(pb["time_ms"], 104_954)
+            self.assertEqual(pb["source_session_id"], run["id"])
+            self.assertTrue(pb["official_time_only"])
+            self.assertFalse(pb["trace_available"])
+            self.assertIsNone(pb["lap"])
+            store.stop_recording()
+
+    def test_active_library_and_timeline_use_non_scanning_live_views(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="race"))
+            race_store = store.race_store
+            self.assertIsNotNone(race_store)
+            with patch.object(race_store, "summary", side_effect=AssertionError("exact summary scan")), patch.object(
+                race_store, "timeline", side_effect=AssertionError("timeline reconstruction")
+            ):
+                active = next(item for item in store.list_sessions() if item["id"] == store.active_recording_id)
+                events = store.race_timeline(store.active_recording_id)
+            self.assertTrue(active["continuous_store"]["continuity_pending"])
+            self.assertEqual(events[0]["type"], "recording_started")
+            self.assertEqual(events[0]["event_validity"], "pending")
+            store.stop_recording()
+
     def test_packet_failure_is_reported_without_escaping_receiver_loop(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))

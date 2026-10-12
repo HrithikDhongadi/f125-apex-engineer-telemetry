@@ -127,12 +127,39 @@ class DashboardContractTests(unittest.TestCase):
     def test_global_and_map_keyboard_shortcuts_are_visible_and_wired(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("Keys 1–5: pages", html)
+        self.assertIn("Keys 1–6: pages", html)
         self.assertIn('aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight + - Q E 0"', html)
         self.assertIn('id="profile-rotate-left"', html)
         self.assertIn('id="profile-rotate-right"', html)
         self.assertIn('document.addEventListener("keydown"', script)
         self.assertIn("activateView(tabs[index])", script)
+
+    def test_circuit_stats_tab_has_ranked_pagination_and_filters(self):
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        styles = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+        self.assertIn('data-view="circuit-stats"', html)
+        self.assertIn('id="view-circuit-stats"', html)
+        for element_id in (
+            "stats-track", "stats-mode", "stats-validity", "stats-session",
+            "stats-year", "stats-compound", "stats-setup", "stats-quality",
+            "stats-order", "stats-search", "circuit-stats-summary",
+            "circuit-stats-laps", "stats-prev", "stats-next",
+            "race-stats-summary", "race-stats-sessions", "race-stats-count",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("CIRCUIT_STATS_PAGE_SIZE = 10", script)
+        self.assertIn("function renderCircuitStats()", script)
+        self.assertIn("function circuitStatsSummary(rows)", script)
+        self.assertIn("function renderRaceStats()", script)
+        self.assertIn("Verified completed results only", script)
+        self.assertIn('["Wins",wins', script)
+        self.assertIn("Final Classification packet", html)
+        self.assertIn("completedAtLine", script)
+        self.assertIn("Best to worst", html)
+        self.assertIn("Theoretical best", script)
+        self.assertIn(".circuit-summary-grid", styles)
+        self.assertIn(".race-summary-grid", styles)
 
     def test_session_library_exposes_recoverable_delete_control(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
@@ -154,6 +181,13 @@ class DashboardContractTests(unittest.TestCase):
         self.assertIn('event.type==="butn"', script)
         self.assertIn('label=controller?"Controller input"', script)
         self.assertIn("event.player_relevant!==false", script)
+
+    def test_live_library_refresh_reuses_historical_lap_cache(self):
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("const lapsBySession = new Map()", script)
+        self.assertIn("activeRecording&&lapsBySession.size", script)
+        self.assertIn("[selectedSessionId,activeRecording.id]", script)
+        self.assertIn("timelineSafe=!activeRecording||selectedSessionId===activeRecording.id", script)
 
     def test_three_engineering_report_types_are_selectable(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")

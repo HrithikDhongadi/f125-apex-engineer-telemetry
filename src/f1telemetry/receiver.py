@@ -19,7 +19,7 @@ from .circuit_profiles import CircuitProfileError, CircuitProfileStore, profile_
 from .protocol import (
     PACKET_CAR_DAMAGE, PACKET_CAR_SETUPS, PACKET_CAR_STATUS, PACKET_CAR_TELEMETRY,
     PACKET_EVENT, PACKET_FINAL_CLASSIFICATION, PACKET_LAP_DATA, PACKET_MOTION,
-    PACKET_MOTION_EX, PACKET_SESSION, decode_event, decode_event_code, decode_header,
+    PACKET_MOTION_EX, PACKET_SESSION, PACKET_SESSION_HISTORY, decode_event, decode_event_code, decode_header,
     decode_packet, decode_player_car_telemetry, decode_player_lap_data, decode_player_setup,
     decode_session, supported_header,
 )
@@ -70,6 +70,16 @@ class Lap:
         return f"lap-{self.saved_at}-{self.number}"
 
     def summary(self, note: str = "") -> dict[str, Any]:
+        context = self.race_context if isinstance(self.race_context, dict) else {}
+        start = context.get("start") if isinstance(context.get("start"), dict) else {}
+        finish = context.get("finish") if isinstance(context.get("finish"), dict) else {}
+        start_status = start.get("car_status") if isinstance(start.get("car_status"), dict) else {}
+        finish_status = finish.get("car_status") if isinstance(finish.get("car_status"), dict) else {}
+        start_lap = start.get("lap") if isinstance(start.get("lap"), dict) else {}
+        finish_lap = finish.get("lap") if isinstance(finish.get("lap"), dict) else {}
+        start_session = start.get("session") if isinstance(start.get("session"), dict) else {}
+        start_damage = start.get("damage") if isinstance(start.get("damage"), dict) else {}
+        finish_damage = finish.get("damage") if isinstance(finish.get("damage"), dict) else {}
         return {
             "id": self.id, "number": self.number, "time_ms": self.time_ms,
             "invalid": self.invalid, "sample_count": len(self.samples),
@@ -85,6 +95,27 @@ class Lap:
             "recording_session_id": self.recording_session_id,
             "game_session_uid": self.game_session_uid, "mode": self.mode,
             "track_id": self.track_id, "track_length_m": self.track_length_m,
+            "actual_tyre_compound": start_status.get("actual_tyre_compound"),
+            "visual_tyre_compound": start_status.get("visual_tyre_compound"),
+            "tyre_age_laps": start_status.get("tyre_age_laps"),
+            "start_fuel_kg": start_status.get("fuel_kg"),
+            "finish_fuel_kg": finish_status.get("fuel_kg"),
+            "start_position": start_lap.get("position"),
+            "finish_position": finish_lap.get("position"),
+            "grid_position": start_lap.get("grid_position"),
+            "start_pit_stops": start_lap.get("pit_stops"),
+            "finish_pit_stops": finish_lap.get("pit_stops"),
+            "start_penalties_s": start_lap.get("penalties_s"),
+            "finish_penalties_s": finish_lap.get("penalties_s"),
+            "start_warnings": start_lap.get("warnings"),
+            "finish_warnings": finish_lap.get("warnings"),
+            "weather": start_session.get("weather"),
+            "race_total_laps": start_session.get("total_laps"),
+            "finish_result_status": finish_lap.get("result_status"),
+            "track_temperature_c": start_session.get("track_temperature_c"),
+            "air_temperature_c": start_session.get("air_temperature_c"),
+            "start_tyre_wear_pct": start_damage.get("tyre_wear_pct"),
+            "finish_tyre_wear_pct": finish_damage.get("tyre_wear_pct"),
             "quality": lap_quality(self),
         }
 
@@ -107,6 +138,7 @@ class RecordingSession:
     sector3_start_m: float | None = None
     circuit_profile_id: str | None = None
     race_store_file: str | None = None
+    final_classification: dict[str, Any] | None = None
 
     def summary(self, laps: list[Lap]) -> dict[str, Any]:
         valid = [lap.time_ms for lap in laps if not lap.invalid]
@@ -1114,6 +1146,8 @@ class SessionStore:
             if self.race_store is None:
                 return
             self.race_store.append_packet(header, payload, distance if isinstance(distance, (int, float)) else None)
+            if header.packet_id == PACKET_SESSION_HISTORY:
+                self._consider_session_history(payload, header)
             lap_number = int(self.active_lap_state.get("lap_number", 0)) or None
             if header.packet_id == PACKET_EVENT:
                 code = str(payload.get("code", "event"))
@@ -1149,6 +1183,17 @@ class SessionStore:
                 if isinstance(old_player, dict) and old_player.get("actual_tyre_compound") != player.get("actual_tyre_compound"):
                     self.race_store.append_event(header.session_time, "compound_change", {"from": old_player.get("actual_tyre_compound"), "to": player.get("actual_tyre_compound")}, "inferred", lap_number)
             elif header.packet_id == PACKET_FINAL_CLASSIFICATION:
+                session = self.sessions.get(self.active_recording_id or "")
+                if session is not None:
+                    session.final_classification = next(
+                        (
+                            dict(car) for car in payload.get("cars", [])
+                            if car.get("car_index") == int(header.player_car_index)
+                        ),
+                        None,
+                    )
+                    if session.final_classification is not None:
+                        self._persist_session(session)
                 self.race_store.append_event(header.session_time, "final_classification", payload, "udp_event", lap_number)
             elif header.packet_id == PACKET_SESSION and isinstance(previous, dict):
                 for key, event_type in (("safety_car_status", "safety_car_state_change"), ("weather", "weather_change")):
@@ -1164,6 +1209,29 @@ class SessionStore:
                     changed = {key: {"from": old_player.get(key), "to": value} for key, value in player.items() if key not in noisy and old_player.get(key) != value}
                     if changed:
                         self.race_store.append_event(header.session_time, "damage_change", changed, "inferred", lap_number)
+
+    def _consider_session_history(self, payload: dict[str, Any], header: Any) -> None:
+        session = self.sessions.get(self.active_recording_id or "")
+        if (
+            session is None or session.mode != "time_trial"
+            or payload.get("car_index") != int(header.player_car_index)
+            or session.track_id is None
+        ):
+            return
+        for history in payload.get("laps", []):
+            if not isinstance(history, dict):
+                continue
+            self.pb_registry.consider_official_history(
+                track_id=session.track_id, track_length_m=session.track_length_m,
+                mode=session.mode, time_ms=int(history.get("lap_time_ms") or 0),
+                sector1_ms=_positive(history.get("sector1_ms")),
+                sector2_ms=_positive(history.get("sector2_ms")),
+                sector3_ms=_positive(history.get("sector3_ms")),
+                lap_number=int(history.get("lap_number") or 0),
+                valid_flags=int(history.get("valid_flags") or 0),
+                session_id=session.id, session_name=session.name,
+                game_session_uid=session.game_session_uid,
+            )
 
     def _finish_lap(self, time_ms: int) -> tuple[bool, str]:
         if self.active_recording_id is None:
@@ -1195,6 +1263,10 @@ class SessionStore:
         self._atomic_json(directory / f"{lap.id}.json", payload, compact=True)
         self._persist_session(session)
         self.pb_registry.consider(lap, session.name, self.notes.get(lap.id, ""))
+        if self.race_store is not None:
+            # A completed lap is a useful durability boundary even though raw
+            # packet writes are otherwise committed in short batches.
+            self.race_store.flush()
         return True, "finish_saved_official_time_and_minimum_samples_present"
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -1212,7 +1284,10 @@ class SessionStore:
             and session.status not in OPEN_STATUSES
         )
         if session.id == self.active_recording_id and self.race_store is not None:
-            result["continuous_store"] = self.race_store.summary()
+            # The exact continuity audit scans the complete packet table. The
+            # library and one-second live snapshot paths must stay O(1), or
+            # they block the UDP receiver as a race database grows.
+            result["continuous_store"] = self.race_store.live_summary()
         elif session.race_store_file:
             path = self.sessions_dir / session.id / session.race_store_file
             if path.exists():
@@ -1264,14 +1339,34 @@ class SessionStore:
 
     def race_timeline(self, session_id: str, lap_from: int | None = None, lap_to: int | None = None) -> list[dict[str, Any]]:
         with self.lock:
-            return self._race_timeline_unlocked(session_id, lap_from, lap_to)
+            session = self.sessions.get(session_id)
+            if session is None or not session.race_store_file:
+                raise SessionStateError("Continuous race data is unavailable for this session")
+            if session_id == self.active_recording_id and self.race_store is not None:
+                events = self.race_store.live_timeline()
+                return [
+                    event for event in events
+                    if (lap_from is None or event.get("lap_number") is None or event["lap_number"] >= lap_from)
+                    and (lap_to is None or event.get("lap_number") is None or event["lap_number"] <= lap_to)
+                ]
+            path = self.sessions_dir / session_id / session.race_store_file
+        # Closed-session reconstruction can be expensive. It uses its own
+        # read-only SQLite connection and must not retain the recorder lock.
+        if not path.exists():
+            raise SessionStateError("Continuous race data is unavailable for this legacy session")
+        return RaceSessionStore.read_timeline(path, lap_from, lap_to)
 
     def _race_timeline_unlocked(self, session_id: str, lap_from: int | None, lap_to: int | None) -> list[dict[str, Any]]:
         session = self.sessions.get(session_id)
         if session is None or not session.race_store_file:
             raise SessionStateError("Continuous race data is unavailable for this session")
         if session_id == self.active_recording_id and self.race_store is not None:
-            return self.race_store.timeline(lap_from, lap_to)
+            events = self.race_store.live_timeline()
+            return [
+                event for event in events
+                if (lap_from is None or event.get("lap_number") is None or event["lap_number"] >= lap_from)
+                and (lap_to is None or event.get("lap_number") is None or event["lap_number"] <= lap_to)
+            ]
         path = self.sessions_dir / session_id / session.race_store_file
         if not path.exists():
             raise SessionStateError("Continuous race data is unavailable for this legacy session")
@@ -1426,11 +1521,43 @@ class SessionStore:
 
     def rebuild_personal_bests(self) -> dict[str, int]:
         with self.lock:
-            return self.pb_registry.rebuild(
+            result = self.pb_registry.rebuild(
                 self.laps,
                 lambda session_id: self.sessions.get(session_id, self.sessions[LEGACY_SESSION_ID]).name,
                 lambda lap_id: self.notes.get(lap_id, ""),
             )
+            history_considered = history_updated = 0
+            for session in self.sessions.values():
+                if session.mode != "time_trial" or session.track_id is None or not session.race_store_file:
+                    continue
+                database = self.sessions_dir / session.id / session.race_store_file
+                if not database.exists():
+                    continue
+                try:
+                    payload = RaceSessionStore.read_latest_player_session_history(database)
+                    histories = payload.get("laps", []) if payload else []
+                except (OSError, sqlite3.Error, TypeError, ValueError):
+                    continue
+                for history in histories:
+                    if not isinstance(history, dict):
+                        continue
+                    history_considered += 1
+                    entry = self.pb_registry.consider_official_history(
+                        track_id=session.track_id, track_length_m=session.track_length_m,
+                        mode=session.mode, time_ms=int(history.get("lap_time_ms") or 0),
+                        sector1_ms=_positive(history.get("sector1_ms")),
+                        sector2_ms=_positive(history.get("sector2_ms")),
+                        sector3_ms=_positive(history.get("sector3_ms")),
+                        lap_number=int(history.get("lap_number") or 0),
+                        valid_flags=int(history.get("valid_flags") or 0),
+                        session_id=session.id, session_name=session.name,
+                        game_session_uid=session.game_session_uid,
+                    )
+                    history_updated += entry is not None
+            result["official_history_considered"] = history_considered
+            result["official_history_updated"] = history_updated
+            result["updated"] += history_updated
+            return result
 
     def _raw_lap(self, lap: Lap) -> bytes | None:
         if lap.recording_session_id == LEGACY_SESSION_ID:
@@ -1560,6 +1687,14 @@ class UdpReceiver(Thread):
     def run(self) -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # The default Linux UDP buffer is small enough to overflow during
+            # brief filesystem or scheduler stalls. The kernel may clamp this
+            # request to its configured maximum, but even that is preferable
+            # to silently accepting the much smaller default.
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+            except OSError:
+                pass
             sock.bind(("0.0.0.0", self.port))
             sock.settimeout(0.5)
             while not self.stop_event.is_set():

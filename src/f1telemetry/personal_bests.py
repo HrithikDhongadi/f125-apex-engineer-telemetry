@@ -28,7 +28,11 @@ class PersonalBestRegistry:
         for path in sorted(self.directory.glob("track-*.json")):
             try:
                 entry = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(entry, dict) and isinstance(entry.get("key"), str) and isinstance(entry.get("lap"), dict):
+                if (
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("key"), str)
+                    and (isinstance(entry.get("lap"), dict) or entry.get("official_time_only") is True)
+                ):
                     self.entries[entry["key"]] = entry
             except (OSError, ValueError, TypeError):
                 continue
@@ -55,6 +59,24 @@ class PersonalBestRegistry:
         key = pb_key(lap.track_id, lap.mode)
         current = self.entries.get(key)
         if current is not None and int(current["time_ms"]) <= int(lap.time_ms):
+            # An official Session History PB may not have a complete trace.
+            # Keep its authoritative time, but retain the quickest eligible
+            # captured lap as an explicitly separate comparison trace.
+            comparison_time = current.get("comparison_lap_time_ms")
+            if current.get("official_time_only") and (
+                not isinstance(current.get("lap"), dict)
+                or not isinstance(comparison_time, int)
+                or int(lap.time_ms) < comparison_time
+            ):
+                current.update({
+                    "lap": asdict(lap), "trace_available": True,
+                    "comparison_lap_time_ms": lap.time_ms,
+                    "comparison_source_session_id": lap.recording_session_id,
+                    "comparison_source_session_name": session_name,
+                    "comparison_source_lap_id": lap.id,
+                    "comparison_source_lap_number": lap.number,
+                })
+                self._write(current)
             return None
         entry = {
             "key": key, "track_id": lap.track_id, "track_length_m": lap.track_length_m,
@@ -63,6 +85,64 @@ class PersonalBestRegistry:
             "source_session_id": lap.recording_session_id, "source_session_name": session_name,
             "source_lap_id": lap.id, "source_lap_number": lap.number, "note": note,
             "provenance": provenance, "quality": quality, "lap": asdict(lap),
+            "official_time_only": False, "trace_available": True,
+            "comparison_lap_time_ms": lap.time_ms,
+            "comparison_source_session_id": lap.recording_session_id,
+            "comparison_source_session_name": session_name,
+            "comparison_source_lap_id": lap.id,
+            "comparison_source_lap_number": lap.number,
+        }
+        self._write(entry)
+        self.entries[key] = entry
+        return entry
+
+    def consider_official_history(
+        self, *, track_id: int, track_length_m: int | None, mode: str,
+        time_ms: int, sector1_ms: int | None, sector2_ms: int | None,
+        sector3_ms: int | None, lap_number: int, valid_flags: int,
+        session_id: str, session_name: str, game_session_uid: int | None,
+    ) -> dict[str, Any] | None:
+        """Store an official valid lap even when its full telemetry was missed.
+
+        Session History is authoritative for timing and validity, but it does
+        not contain a telemetry trace or setup. A prior full-fidelity PB is
+        retained solely as a comparison trace and is labelled separately.
+        """
+        if (
+            not is_known_track(track_id) or mode != "time_trial"
+            or time_ms < 30_000 or valid_flags != 0x0F
+        ):
+            return None
+        key = pb_key(track_id, mode)
+        current = self.entries.get(key)
+        if current is not None and int(current["time_ms"]) <= int(time_ms):
+            return None
+
+        trace = current.get("lap") if isinstance(current, dict) and isinstance(current.get("lap"), dict) else None
+        trace_time = int(trace["time_ms"]) if trace and isinstance(trace.get("time_ms"), int) else None
+        entry = {
+            "key": key, "track_id": track_id, "track_length_m": track_length_m,
+            "mode": mode, "time_ms": int(time_ms), "sector1_ms": sector1_ms,
+            "sector2_ms": sector2_ms, "sector3_ms": sector3_ms, "setup": None,
+            "became_pb_at": _now(), "source_session_id": session_id,
+            "source_session_name": session_name, "source_lap_id": None,
+            "source_lap_number": int(lap_number), "note": "",
+            "provenance": "Official F1 25 Session History; complete telemetry trace unavailable",
+            "quality": {
+                "adequate_for_pb": True, "official_timing_available": True,
+                "telemetry_complete": False, "validation_source": "session_history_valid_flags",
+            },
+            "official_time_only": True, "trace_available": trace is not None,
+            "official_history": {
+                "game_session_uid": game_session_uid, "valid_flags": int(valid_flags),
+                "lap_number": int(lap_number),
+            },
+            "lap": trace,
+            "comparison_lap_time_ms": trace_time,
+            "comparison_source_session_id": current.get("comparison_source_session_id", current.get("source_session_id")) if trace else None,
+            "comparison_source_session_name": current.get("comparison_source_session_name", current.get("source_session_name")) if trace else None,
+            "comparison_source_lap_id": current.get("comparison_source_lap_id", current.get("source_lap_id")) if trace else None,
+            "comparison_source_lap_number": current.get("comparison_source_lap_number", current.get("source_lap_number")) if trace else None,
         }
         self._write(entry)
         self.entries[key] = entry
@@ -93,9 +173,11 @@ class PersonalBestRegistry:
     def update_source_setup(self, lap_id: str, setup: dict[str, Any]) -> bool:
         updated = False
         for entry in self.entries.values():
-            if entry.get("source_lap_id") == lap_id:
-                entry["setup"] = setup
-                entry["lap"]["setup"] = setup
+            if entry.get("source_lap_id") == lap_id or entry.get("comparison_source_lap_id") == lap_id:
+                if entry.get("source_lap_id") == lap_id:
+                    entry["setup"] = setup
+                if isinstance(entry.get("lap"), dict):
+                    entry["lap"]["setup"] = setup
                 self._write(entry)
                 updated = True
         return updated

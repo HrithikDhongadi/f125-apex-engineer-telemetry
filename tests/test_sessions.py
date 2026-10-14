@@ -577,6 +577,46 @@ class RecordingSessionTests(unittest.TestCase):
             self.assertIsNotNone(store.active_recording_id)
             self.assertNotEqual(store.active_recording_id, race_id)
 
+    def test_one_shot_qualifying_finish_uid_glitch_does_not_create_empty_duplicate(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            one_shot = game(
+                mode="qualifying", session_type=9,
+                session_name="One-Shot Qualifying",
+            )
+            store.record_game_session(one_shot)
+            qualifying_id = store.active_recording_id
+            store.record_lap_state(lap_state(1), UID, {"session_time": 1.0})
+            fill_lap(store, UID, 1)
+
+            # Observed in the Miami and Montreal captures: the completed UID
+            # briefly changes, then its trailing Session/Lap Data bundle comes
+            # back on lap 2 and previously opened a zero-lap duplicate.
+            store.record_telemetry(telemetry(), 79.55, UID + 99)
+            self.assertIsNone(store.active_recording_id)
+            self.assertEqual(store.sessions[qualifying_id].status, "completed")
+
+            store.record_game_session(one_shot)
+            store.record_lap_state(
+                lap_state(2, 16, 3.14, 74_671, total_distance=4_374.58),
+                UID,
+                {"session_time": 79.568, "frame_identifier": 4_769},
+            )
+            self.assertIsNone(store.active_recording_id)
+            self.assertEqual(
+                [session.id for session in store.sessions.values() if session.mode == "qualifying"],
+                [qualifying_id],
+            )
+            self.assertEqual([lap.number for lap in store.session_laps[qualifying_id]], [1])
+
+            # A genuinely new one-shot UID must still start immediately.
+            store.record_game_session(game(
+                uid=UID + 200, mode="qualifying", session_type=9,
+                session_name="One-Shot Qualifying",
+            ))
+            self.assertIsNotNone(store.active_recording_id)
+            self.assertNotEqual(store.active_recording_id, qualifying_id)
+
     def test_profile_deletion_clears_session_reference_and_is_recoverable(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

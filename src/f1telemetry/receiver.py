@@ -31,7 +31,7 @@ from .settings import SettingsStore
 
 LEGACY_SESSION_ID = "legacy"
 OPEN_STATUSES = {"armed", "recording"}
-RACE_UID_REOPEN_GUARD_SECONDS = 5.0
+SESSION_UID_REOPEN_GUARD_SECONDS = 5.0
 AUTOMATIC_RECORDING_MODES = {"practice", "qualifying", "race"}
 ONE_SHOT_SESSION_TYPES = {9, 14}
 MAX_DIAGNOSTIC_SEGMENTS = 8
@@ -219,7 +219,7 @@ class SessionStore:
         self.active_recording_id: str | None = None
         self.selected_session_id: str | None = None
         self.manual_stop_session_key: tuple[int, int] | None = None
-        self.race_uid_reopen_guard: dict[int, float] = {}
+        self.session_uid_reopen_guard: dict[int, float] = {}
         self.current_setup: dict[str, Any] | None = None
         self.active_lap_number: int | None = None
         self.active_invalid = False
@@ -335,11 +335,12 @@ class SessionStore:
         previous_uid = self.game_session_uid
         active = self.sessions.get(self.active_recording_id or "")
         self._close_active("completed")
-        if active is not None and active.mode == "race" and previous_uid is not None:
-            # At race finish F1 25 can emit a momentary different UID before a
-            # final bundle from the completed UID. Do not let that trailing
-            # Session packet create a second empty automatic recording.
-            self.race_uid_reopen_guard[previous_uid] = monotonic() + RACE_UID_REOPEN_GUARD_SECONDS
+        if active is not None and active.mode in AUTOMATIC_RECORDING_MODES and previous_uid is not None:
+            # At the end of an automatically recorded phase F1 25 can emit a
+            # momentary different UID before a final bundle from the completed
+            # UID. This is observed after both races and one-shot qualifying.
+            # Do not let that trailing Session packet create an empty duplicate.
+            self.session_uid_reopen_guard[previous_uid] = monotonic() + SESSION_UID_REOPEN_GUARD_SECONDS
         self._reset_lap()
         self.game_session_uid = session_uid
         self.game_mode, self.game_session_type = "unknown", None
@@ -387,16 +388,16 @@ class SessionStore:
             })
             self._touch()
             now = monotonic()
-            self.race_uid_reopen_guard = {
-                uid: expires for uid, expires in self.race_uid_reopen_guard.items()
+            self.session_uid_reopen_guard = {
+                uid: expires for uid, expires in self.session_uid_reopen_guard.items()
                 if expires > now
             }
-            guarded_tail = self.race_uid_reopen_guard.get(self.game_session_uid, 0) > now
+            guarded_tail = self.session_uid_reopen_guard.get(self.game_session_uid, 0) > now
             if (
                 self.game_mode in AUTOMATIC_RECORDING_MODES
                 and self.active_recording_id is None
                 and self.manual_stop_session_key != (self.game_session_uid, self.game_session_type)
-                and (self.game_mode != "race" or not guarded_tail)
+                and not guarded_tail
             ):
                 session_name = str(game.get("session_type_name") or self.game_mode.replace("_", " ").title())
                 self._create_recording(f"{session_name} · {track_name(self.track_id)}", self.game_mode, automatic=True)

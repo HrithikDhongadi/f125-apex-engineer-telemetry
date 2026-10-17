@@ -9,6 +9,14 @@ from src.f1telemetry.server import LOGGER, configure_server_logging
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def frontend_source() -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "frontend").rglob("*.js"))
+        if "tests" not in path.parts
+    )
+
+
 class DashboardContractTests(unittest.TestCase):
     def test_server_log_uses_dated_filename_and_timestamped_lines(self):
         with TemporaryDirectory() as directory:
@@ -35,7 +43,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_settings_page_exposes_runtime_and_telemetry_configuration(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn('data-view="settings"', html)
         for element_id in (
             "settings-form", "setting-web-host", "setting-web-port", "setting-udp-port",
@@ -72,7 +80,7 @@ class DashboardContractTests(unittest.TestCase):
         ):
             self.assertIn(f'id="{element_id}"', html)
 
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn("click its apex/midpoint on the trace", script)
         self.assertIn("manually pointed apex on clean Motion X/Z lap trace", script)
         self.assertIn("profileEditorDirty", script)
@@ -108,11 +116,12 @@ class DashboardContractTests(unittest.TestCase):
         self.assertIn("shiftKey", editor)
         self.assertIn("x: offsetX + usedWidth - (Number(point.x) - minX) * scale", editor)
         self.assertIn("x: p.offsetX + p.usedWidth - (Number(point.x) - p.minX) * p.scale", editor)
-        self.assertIn('src="circuit-profiler.bundle.js"', html)
+        self.assertIn('src="app.bundle.js"', html)
+        self.assertNotIn('src="circuit-profiler.bundle.js"', html)
 
     def test_lap_analysis_has_profile_based_local_pace_map(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn("Where the lap time was won", html)
         self.assertIn('id="pace-map-profile"', html)
         self.assertIn('id="pace-map-canvas"', html)
@@ -122,26 +131,27 @@ class DashboardContractTests(unittest.TestCase):
         self.assertIn("Candidate gains", html)
         self.assertIn("Baseline gains", html)
         self.assertIn("function drawPaceMap", script)
-        self.assertIn("new window.PaceMapCanvas", script)
+        self.assertIn("new PaceMapCanvas", script)
         self.assertIn("circuit_map", script)
         self.assertIn("local change", html)
         editor = (ROOT / "frontend" / "circuit-profiler.js").read_text(encoding="utf-8")
         self.assertIn("class PaceMapCanvas", editor)
-        self.assertIn("window.PaceMapCanvas", editor)
+        self.assertIn("export class PaceMapCanvas", editor)
 
     def test_global_and_map_keyboard_shortcuts_are_visible_and_wired(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn("Keys 1–6: pages", html)
         self.assertIn('aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight + - Q E 0"', html)
         self.assertIn('id="profile-rotate-left"', html)
         self.assertIn('id="profile-rotate-right"', html)
-        self.assertIn('document.addEventListener("keydown"', script)
+        self.assertIn('events.on(document, "keydown"', script)
+        self.assertIn("export function createEventRegistry", script)
         self.assertIn("activateView(tabs[index])", script)
 
     def test_circuit_stats_tab_has_ranked_pagination_and_filters(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         styles = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
         self.assertIn('data-view="circuit-stats"', html)
         self.assertIn('id="view-circuit-stats"', html)
@@ -168,14 +178,14 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_session_library_exposes_recoverable_delete_control(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn('id="delete-session"', html)
         self.assertIn('/delete`,{confirm:true}', script)
         self.assertIn("recoverable local trash", html)
 
     def test_controller_events_have_a_friendly_optional_timeline_filter(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn('id="timeline-controller-events"', html)
         self.assertIn('id="timeline-other-car-events"', html)
         self.assertIn('id="timeline-superseded-events"', html)
@@ -188,14 +198,16 @@ class DashboardContractTests(unittest.TestCase):
         self.assertIn("event.player_relevant!==false", script)
 
     def test_live_and_library_refreshes_are_bounded_and_change_aware(self):
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("const lapsBySession = new Map()", script)
+        script = frontend_source()
+        self.assertIn("createDashboardState", script)
+        self.assertIn("new RequestGeneration", script)
         self.assertIn('request("/api/live")', script)
         self.assertIn('request("/api/laps?all=1")', script)
         self.assertIn("Number(previous.lap_count)!==Number(session.lap_count)", script)
         self.assertIn("libraryRequestPending", script)
         self.assertIn("liveRequestPending", script)
         self.assertIn("background&&document.hidden", script)
+        self.assertIn("libraryGeneration.isCurrent", script)
         self.assertIn("timelineBySession", script)
         self.assertIn("timelineRequests", script)
         self.assertIn("async function ensureSelectedTimeline()", script)
@@ -209,7 +221,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_page_chrome_hides_irrelevant_recorder_clutter(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         styles = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
         self.assertIn('<body data-view="live">', html)
         self.assertIn("document.body.dataset.view=button.dataset.view", script)
@@ -219,7 +231,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_displayed_session_selector_follows_each_date_filter(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         recorder = html.split('<section class="panel recorder"', 1)[1].split('</section>', 1)[0]
         self.assertNotIn("data-displayed-session-select", recorder)
         self.assertEqual(html.count("data-displayed-session-select"), 3)
@@ -237,7 +249,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_three_engineering_report_types_are_selectable(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn('id="report-type"', html)
         for value in ("lap_analysis", "race", "time_trial"):
             self.assertIn(f'value="{value}"', html)
@@ -247,7 +259,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_exploratory_invalid_and_cross_mode_comparisons_show_warnings(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn('id="compare-warning"', html)
         self.assertIn('id="comparison-warnings"', html)
         self.assertIn('conditions are not like-for-like; results will be exploratory', script)
@@ -256,7 +268,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_practice_qualifying_and_long_lists_are_exposed_cleanly(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn('<option value="practice">Practice</option>', html)
         self.assertIn('<option value="qualifying">Qualifying / Shootout</option>', html)
         for element_id in (
@@ -271,7 +283,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_session_lap_ranking_matches_circuit_ranking_evidence(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         styles = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
         session_view = html.split('<section id="view-session"', 1)[1].split('<section id="view-circuit-profiler"', 1)[0]
         for heading in (
@@ -293,16 +305,16 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_comparison_summary_uses_compact_expandable_setup_section(self):
         styles = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         self.assertIn("width:min(1680px,100%)", styles)
         self.assertIn(".setup-comparison", styles)
         self.assertIn(".setup-change-grid", styles)
         self.assertIn('<details class="setup-comparison">', script)
-        self.assertIn("function setupDifferences", script)
+        self.assertIn("export function setupDifferences", script)
 
     def test_session_archive_is_hidden_until_filtered_by_date(self):
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         global_shell = html.split('<section id="view-live"', 1)[0]
         analysis_view = html.split('<section id="view-analysis"', 1)[1].split('<section id="view-circuit-stats"', 1)[0]
         session_view = html.split('<section id="view-session"', 1)[1].split('<section id="view-circuit-profiler"', 1)[0]
@@ -318,8 +330,8 @@ class DashboardContractTests(unittest.TestCase):
         self.assertEqual(html.count("data-session-filter aria-label="), 3)
         self.assertEqual(html.count('data-session-filter-field="year"'), 3)
         self.assertIn("No archive sessions shown", html)
-        self.assertIn("function filteredSessions()", script)
-        self.assertIn("function sessionChoices()", script)
+        self.assertIn("export function filteredSessions", script)
+        self.assertIn("export function sessionChoices", script)
         self.assertIn("function renderSessionQuery()", script)
         self.assertIn("Choose a year above to show saved sessions.", script)
         self.assertIn("sessionChoices().map", script)
@@ -329,7 +341,7 @@ class DashboardContractTests(unittest.TestCase):
 
     def test_f1_theme_keeps_brand_and_telemetry_colours_distinct(self):
         styles = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
-        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        script = frontend_source()
         profiler = (ROOT / "frontend" / "circuit-profiler.js").read_text(encoding="utf-8")
         self.assertIn("--brand:#e10600", styles)
         self.assertIn("--green:#36d996", styles)

@@ -49,6 +49,49 @@ def fill_lap(store, uid, number, time_ms=90_000):
 
 
 class RecordingSessionTests(unittest.TestCase):
+    def test_historical_traces_load_lazily_through_indexed_byte_cache(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SessionStore(root)
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(1), UID)
+            run = store.start_time_trial_run("lazy archive")
+            fill_lap(store, UID, 1, 90_000)
+            store.stop_recording()
+            lap_id = store.session_laps[run["id"]][0].id
+
+            reloaded = SessionStore(root)
+            metadata = reloaded.lap_by_id[lap_id]
+            self.assertEqual(metadata.samples, [])
+            self.assertGreater(metadata.summary()["sample_count"], 0)
+            with patch.object(reloaded.archive, "load_full_lap", wraps=reloaded.archive.load_full_lap) as loader:
+                summaries = reloaded.list_laps(run["id"])
+                self.assertGreater(summaries[0]["sample_count"], 0)
+                loader.assert_not_called()
+                first = reloaded.get_lap_object(lap_id)
+                second = reloaded.get_lap_object(lap_id)
+                self.assertGreater(len(first.samples), 0)
+                self.assertIs(first, second)
+                loader.assert_called_once()
+            self.assertTrue((root / "archive-index.json").is_file())
+
+    def test_paginated_archive_queries_are_additive_and_filtered(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game())
+            store.record_lap_state(lap_state(1), UID)
+            run = store.start_time_trial_run("pagination")
+            fill_lap(store, UID, 1, 90_000)
+            fill_lap(store, UID, 2, 91_000)
+            store.stop_recording()
+
+            page = store.list_laps_page(1, 1, session_id=run["id"], validity="valid")
+            self.assertEqual(page["pagination"], {"page": 1, "page_size": 1, "pages": 2, "total": 2})
+            self.assertEqual(len(page["laps"]), 1)
+            self.assertEqual(len(store.list_laps(run["id"])), 2)
+            sessions = store.list_sessions_page(1, 10, mode="time_trial", track_id=7)
+            self.assertEqual(sessions["pagination"]["total"], 1)
+            self.assertEqual(sessions["sessions"][0]["id"], run["id"])
     def test_live_snapshot_is_small_and_all_laps_can_be_hydrated_once(self):
         with TemporaryDirectory() as directory:
             store = SessionStore(Path(directory))
@@ -670,6 +713,44 @@ class RecordingSessionTests(unittest.TestCase):
             self.assertEqual(laps[0].time_ms, 100_077)
             self.assertAlmostEqual(laps[0].samples[0]["lap_distance_m"], 25.83)
             self.assertGreater(laps[0].samples[-1]["lap_distance_m"], 5_880)
+
+    def test_race_lap_one_keeps_grid_launch_when_starting_behind_timing_line(self):
+        with TemporaryDirectory() as directory:
+            store = SessionStore(Path(directory))
+            store.record_game_session(game(mode="race", track_length=4_371))
+            run_id = store.active_recording_id
+
+            store.record_lap_state(lap_state(
+                1, 0, -105.97, 0, total_distance=-105.97,
+            ), UID, {"session_time": 0.0, "frame_identifier": 0})
+            store.record_telemetry(telemetry(0), 0.0, UID)
+            store.record_lap_state(lap_state(
+                1, 2_500, -50.0, 0, total_distance=-50.0,
+            ), UID, {"session_time": 2.5, "frame_identifier": 150})
+            store.record_telemetry(telemetry(90), 2.5, UID)
+            store.record_lap_state(lap_state(
+                1, 4_888, 0.23, 0, total_distance=0.23,
+            ), UID, {"session_time": 4.905, "frame_identifier": 293})
+            store.record_telemetry(telemetry(150), 4.905, UID)
+
+            for index in range(30):
+                progress = (index + 1) / 30
+                store.record_lap_state(lap_state(
+                    1, int(4_888 + progress * (84_600 - 4_888)),
+                    0.23 + progress * 4_370,
+                    total_distance=0.23 + progress * 4_370,
+                ), UID)
+                store.record_telemetry(telemetry(180 + index), 4.905 + progress * 79.7, UID)
+            store.record_lap_state(lap_state(
+                2, 0, 0.2, 84_648, total_distance=4_371.6,
+            ), UID)
+
+            laps = store.session_laps[run_id]
+            self.assertEqual([lap.number for lap in laps], [1])
+            self.assertEqual(laps[0].time_ms, 84_648)
+            self.assertEqual(laps[0].samples[0]["lap_distance_m"], -105.97)
+            self.assertEqual(laps[0].samples[0]["speed_kph"], 0)
+            self.assertGreater(laps[0].samples[-1]["lap_distance_m"], 4_360)
 
     def test_new_uid_closes_and_resets_without_mixing_samples(self):
         with TemporaryDirectory() as directory:

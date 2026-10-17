@@ -315,66 +315,66 @@ Complete each phase in a separate, reviewable PR where practical. Every phase mu
 
 ### 1. Establish the baseline
 
-- [ ] Record the current commit and check differences from reviewed commit `13b1ad5`.
-- [ ] Run `npm ci` and `npm run check`; report failures and skipped tests.
-- [ ] Inventory CLI commands, API contracts, file formats, and generated assets.
-- [ ] Capture expected behavior for first laps, restarts, flashbacks, session changes, and PB updates.
-- [ ] Identify how to supply the missing recorded-Spa regression fixture.
+- [x] Record the current commit and check differences from reviewed commit `13b1ad5`. See `docs/architecture-baseline-2026-10-15.md`.
+- [x] Run `npm ci` and `npm run check`; report failures and skipped tests. All 122 tests passed locally with no skips.
+- [x] Inventory CLI commands, API contracts, file formats, and generated assets. See `docs/architecture-baseline-2026-10-15.md`.
+- [x] Capture expected behavior for first laps, restarts, flashbacks, session changes, and PB updates. See the ordering-sensitive behavior baseline in `docs/architecture-baseline-2026-10-15.md`.
+- [x] Identify how to supply the missing recorded-Spa regression fixture. The local fixture identity and restore path are recorded in `docs/architecture-baseline-2026-10-15.md`.
 
 ### 2. Separate models and startup
 
-- [ ] Move `Lap`, `RecordingSession`, and shared exceptions into neutral domain modules.
-- [ ] Remove analysis dependencies on `receiver.py`.
-- [ ] Extract dependency creation, thread startup, and shutdown into `bootstrap.py`.
-- [ ] Preserve existing imports and `python3 -m src.f1telemetry`.
-- [ ] Update checks to include nested Python modules.
+- [x] Move `Lap`, `RecordingSession`, and shared exceptions into neutral domain modules. See `src/f1telemetry/domain/`.
+- [x] Remove analysis dependencies on `receiver.py`. `analysis.py` now imports `Lap` from the domain.
+- [x] Extract dependency creation, thread startup, and shutdown into `bootstrap.py`.
+- [x] Preserve existing imports and `python3 -m src.f1telemetry`. Compatibility is covered by `tests/test_architecture.py`.
+- [x] Update checks to include nested Python modules. `check:python` now uses recursive `compileall`.
 
 ### 3. Separate application responsibilities
 
-- [ ] Extract session/lap file access and archive loading.
-- [ ] Extract trash, restoration, settings, and diagnostics workflows.
-- [ ] Extract setup amendments while preserving audit backups and PB updates.
-- [ ] Centralize comparison compatibility and profile-selection policies.
-- [ ] Make offline reporting independent of recorder startup and its side effects.
+- [x] Extract session/lap file access and archive loading. See `src/f1telemetry/application/archive.py`.
+- [x] Extract trash, restoration, settings, and diagnostics workflows. See `src/f1telemetry/application/administration.py` and `diagnostics.py`.
+- [x] Extract setup amendments while preserving audit backups and PB updates. See `src/f1telemetry/application/amendments.py`.
+- [x] Centralize comparison compatibility and profile-selection policies. See `src/f1telemetry/application/comparisons.py` and `profiles.py`.
+- [x] Make offline reporting independent of recorder startup and its side effects. See `src/f1telemetry/application/offline_reports.py` and `docs/architecture-phase-3-application-responsibilities-2026-10-15.md`.
 
 ### 4. Structure the frontend
 
-- [ ] Create an ES-module dashboard entry point using the existing build tool.
-- [ ] Separate API access, state, polling, rendering, and event registration.
-- [ ] Extract Live, Sessions, Analysis, Circuit Stats, Circuit Profiler, Settings, and PB features.
-- [ ] Preserve unsaved drafts, export selections, and independent comparison selectors.
-- [ ] Prevent stale responses from repainting a newly selected session.
-- [ ] Add behavioral tests for critical interactions; replace fragile source-string assertions where appropriate.
-- [ ] Rebuild generated assets from source.
+- [x] Create an ES-module dashboard entry point using the existing build tool. See `frontend/main.js` and `package.json`.
+- [x] Separate API access, state, polling, rendering, and event registration. See the focused directories under `frontend/`.
+- [x] Extract Live, Sessions, Analysis, Circuit Stats, Circuit Profiler, Settings, and PB features. See `frontend/features/`.
+- [x] Preserve unsaved drafts, export selections, and independent comparison selectors. See `frontend/state/selectors.js`.
+- [x] Prevent stale responses from repainting a newly selected session. See `frontend/state/store.js` and the generation checks in `frontend/main.js`.
+- [x] Add behavioral tests for critical interactions; replace fragile source-string assertions where appropriate. See `frontend/tests/` and `tests/test_dashboard.py`.
+- [x] Rebuild generated assets from source. See `static/app.bundle.js` and `docs/architecture-phase-4-frontend-structure-2026-10-15.md`.
 
 ### 5. Isolate the recorder
 
-- [ ] Define explicit recorder state, observations, decisions, and reason codes.
-- [ ] Extract lap-boundary decisions from persistence and diagnostics.
-- [ ] Preserve current packet-processing order, thresholds, and decision precedence.
-- [ ] Verify first-full-lap, same-number restart, flashback pruning, grid-start, and qualifying-phase regressions.
-- [ ] Keep the existing threading model during extraction.
+- [x] Define explicit recorder state, observations, decisions, and reason codes. See `src/f1telemetry/domain/recording.py`.
+- [x] Extract lap-boundary decisions from persistence and diagnostics. See `decide_lap_boundary()` and `src/f1telemetry/application/recorder.py`.
+- [x] Preserve current packet-processing order, thresholds, and decision precedence. See `tests/test_recording.py` and `docs/architecture-phase-5-recorder-isolation-2026-10-15.md`.
+- [x] Verify first-full-lap, same-number restart, flashback pruning, grid-start, and qualifying-phase regressions. The focused and existing captured-sequence tests pass.
+- [x] Keep the existing threading model during extraction. `UdpReceiver` remains the single daemon receiver thread and `SessionStore` remains the sole recorder lock owner.
 
 ### 6. Separate storage, reconstruction, and exports
 
-- [ ] Separate SQLite writing, schema handling, reconstruction, continuity, and migration.
-- [ ] Preserve accepted/superseded/unknown branches and player attribution.
-- [ ] Capture consistent export inputs at a defined recording revision.
-- [ ] Move report rendering and ZIP creation outside the recorder lock.
-- [ ] Protect exports against concurrent deletion or setup amendments.
-- [ ] Preserve SQLite WAL-safe snapshots and legacy/text/compressed readers.
-- [ ] Verify recording continues correctly during a large export.
+- [x] Separate SQLite writing, schema handling, reconstruction, continuity, and migration. See `src/f1telemetry/storage/` and `src/f1telemetry/reconstruction/`.
+- [x] Preserve accepted/superseded/unknown branches and player attribution. Existing reconstruction regressions remain unchanged and passing.
+- [x] Capture consistent export inputs at a defined recording revision. ZIPs include `export-revision.json` with component hashes and committed packet/event watermarks.
+- [x] Move report rendering and ZIP creation outside the recorder lock. See `src/f1telemetry/application/exports.py`.
+- [x] Protect exports against concurrent deletion or setup amendments. Inputs and original lap bytes are detached and the SQLite snapshot lives outside the session directory.
+- [x] Preserve SQLite WAL-safe snapshots and legacy/text/compressed readers. Online backup and v1/v2 migration/digest tests pass.
+- [x] Verify recording continues correctly during a large export. See `test_recording_continues_while_large_zip_is_rendered` in `tests/test_exports.py`.
 
 ### 7. Improve data structures and performance
 
-- [ ] Introduce dictionaries for lap/session identity lookup.
-- [ ] Cache lap summaries and maintain session summaries incrementally.
-- [ ] Load historical telemetry lazily through a byte-bounded cache.
-- [ ] Replace unnecessary full-table allocations with streaming queries.
-- [ ] Use `deque` for ordered event matching.
-- [ ] Generate large ZIPs through temporary files instead of archive-sized memory buffers.
-- [ ] Add server-side archive pagination without breaking existing callers.
-- [ ] Benchmark startup time, RAM, processing latency, live API latency, and exports before considering a recorder queue.
+- [x] Introduce dictionaries for lap/session identity lookup. Backend and frontend indexes are documented in `docs/architecture-phase-7-data-structures-performance-2026-10-15.md`.
+- [x] Cache lap summaries and maintain session summaries incrementally. Mutation invalidation and completed-lap updates remain under `SessionStore` ownership.
+- [x] Load historical telemetry lazily through a byte-bounded cache. The rebuildable metadata sidecar and 128 MiB LRU are documented in the Phase 7 report.
+- [x] Replace unnecessary full-table allocations with streaming queries. Continuity analysis now consumes SQLite cursors and keeps bounded top-gap detail.
+- [x] Use `deque` for ordered event matching. FIFO event candidates now use constant-time `popleft()`.
+- [x] Generate large ZIPs through temporary files instead of archive-sized memory buffers. HTTP exports stream the temporary artifact and compatibility callers retain bytes.
+- [x] Add server-side archive pagination without breaking existing callers. Pagination is opt-in, filtered, capped, and additive to the old response contracts.
+- [x] Benchmark startup time, RAM, processing latency, live API latency, and exports before considering a recorder queue. Results and limitations are recorded in `docs/architecture-phase-7-data-structures-performance-2026-10-15.md`; no queue was justified or added.
 
 ### Acceptance for every PR
 

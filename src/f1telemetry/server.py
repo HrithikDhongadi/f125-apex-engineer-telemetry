@@ -8,15 +8,16 @@ import json
 import logging
 from pathlib import Path
 import sys
-from threading import Event, Thread
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .analysis import ComparisonError, calibration_trace, compare_laps
+from .application.comparisons import ComparisonPolicyError, resolve_comparison_profile
 from .circuit_profiles import CircuitProfileError
-from .receiver import SessionStateError, SessionStore, UdpReceiver
+from .domain.errors import SessionStateError
+from .receiver import SessionStore
 from .reports import ExportError
 from .setups import SETUP_FIELDS, SetupValidationError
-from .settings import SettingsError, SettingsStore, settings_payload
+from .settings import SettingsError, settings_payload
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "static"
@@ -53,7 +54,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self) -> None:
         # Revalidate dashboard assets so local upgrades do not leave an old
-        # app.js or stylesheet paired with a newer server API.
+        # app.bundle.js or stylesheet paired with a newer server API.
         if not urlparse(self.path).path.startswith("/api/"):
             self.send_header("Cache-Control", "no-cache")
         super().end_headers()
@@ -77,6 +78,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return self._json(self.store.snapshot())
         if path == "/api/laps":
             query = parse_qs(request.query)
+            if any(key in query for key in ("page", "page_size", "track_id", "mode", "validity")):
+                try:
+                    return self._json(self.store.list_laps_page(
+                        int(query.get("page", [1])[0]), int(query.get("page_size", [50])[0]),
+                        session_id=query.get("session", [None])[0],
+                        track_id=int(query["track_id"][0]) if query.get("track_id") else None,
+                        mode=query.get("mode", [""])[0], validity=query.get("validity", [""])[0],
+                    ))
+                except (SessionStateError, ValueError) as error:
+                    return self._json({"error": str(error)}, 400)
             if query.get("all", [""])[0] == "1":
                 return self._json({"laps": self.store.list_all_laps()})
             session_id = query.get("session", [None])[0]
@@ -85,6 +96,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             except SessionStateError as error:
                 return self._json({"error": str(error)}, 404)
         if path == "/api/sessions":
+            query = parse_qs(request.query)
+            if any(key in query for key in ("page", "page_size", "year", "month", "day", "mode", "track_id")):
+                try:
+                    result = self.store.list_sessions_page(
+                        int(query.get("page", [1])[0]), int(query.get("page_size", [25])[0]),
+                        year=query.get("year", [""])[0], month=query.get("month", [""])[0],
+                        day=query.get("day", [""])[0], mode=query.get("mode", [""])[0],
+                        track_id=int(query["track_id"][0]) if query.get("track_id") else None,
+                    )
+                    return self._json({**result, **self.store.live_snapshot()})
+                except ValueError as error:
+                    return self._json({"error": str(error)}, 400)
             return self._json({"sessions": self.store.list_sessions(), **self.store.live_snapshot()})
         if path == "/api/personal-bests":
             return self._json({"personal_bests": self.store.list_personal_bests()})
@@ -115,15 +138,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 filename, content_type, body = self.store.export_session(
                     session_id, query.get("scope", ["session"])[0], query.get("lap", []),
                     query.get("format", ["markdown"])[0], query.get("report", ["auto"])[0],
+                    file_output=query.get("format", ["markdown"])[0] == "zip",
                 )
-                return self._download(body, content_type, filename)
+                return self._download_file(body, content_type, filename) if isinstance(body, Path) else self._download(body, content_type, filename)
             except ExportError as error:
                 return self._json({"error": str(error)}, 400 if "Unknown session" not in str(error) else 404)
         if path.startswith("/api/sessions/") and path.endswith("/laps"):
             session_id = unquote(path[len("/api/sessions/"):-len("/laps")].rstrip("/"))
+            query = parse_qs(request.query)
             try:
+                if any(key in query for key in ("page", "page_size", "validity")):
+                    return self._json({"session_id": session_id, **self.store.list_laps_page(
+                        int(query.get("page", [1])[0]), int(query.get("page_size", [50])[0]),
+                        session_id=session_id, validity=query.get("validity", [""])[0],
+                    )})
                 return self._json({"session_id": session_id, "laps": self.store.list_laps(session_id)})
-            except SessionStateError as error:
+            except (SessionStateError, ValueError) as error:
                 return self._json({"error": str(error)}, 404)
         if path == "/api/compare/report":
             query = parse_qs(request.query)
@@ -147,19 +177,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 missing = baseline_id if baseline is None else candidate_id
                 return self._json({"error": f"Unknown lap ID: {missing}"}, 404)
             try:
-                session = self.store.sessions.get(baseline.recording_session_id)
-                candidate_session = self.store.sessions.get(candidate.recording_session_id)
-                profile = self.store.profile_store.get(session.circuit_profile_id) if session and session.circuit_profile_id else None
-                if profile is None and candidate_session and candidate_session.circuit_profile_id:
-                    profile = self.store.profile_store.get(candidate_session.circuit_profile_id)
-                if (
-                    baseline.mode == candidate.mode == "race"
-                    and baseline.recording_session_id != candidate.recording_session_id
-                    and (not session or not candidate_session or session.circuit_profile_id != candidate_session.circuit_profile_id)
-                ):
-                    raise ComparisonError("Cross-session race laps must select the same verified circuit profile")
+                profile = resolve_comparison_profile(
+                    baseline,
+                    candidate,
+                    self.store.sessions,
+                    self.store.profile_store,
+                )
                 return self._json(compare_laps(baseline, candidate, profile))
-            except ComparisonError as error:
+            except (ComparisonError, ComparisonPolicyError) as error:
                 return self._json({"error": str(error)}, 400)
         if path.startswith("/api/laps/"):
             if path.endswith("/trace"):
@@ -259,43 +284,25 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             LOGGER.warning("Client disconnected while downloading %s", self.path)
 
+    def _download_file(self, path: Path, content_type: str, filename: str):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with path.open("rb") as source:
+                while chunk := source.read(1024 * 1024):
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            LOGGER.warning("Client disconnected while downloading %s", self.path)
+        finally:
+            path.unlink(missing_ok=True)
+
 
 def serve(port: int | None = None, udp_port: int | None = None, host: str | None = None) -> None:
-    log_path = configure_server_logging()
-    configured = SettingsStore(DATA / "settings.json").load()
-    port = int(port if port is not None else configured["web_port"])
-    udp_port = int(udp_port if udp_port is not None else configured["udp_port"])
-    host = str(host if host is not None else configured["web_host"])
-    store = SessionStore(DATA)
-    receiver = UdpReceiver(store, udp_port)
-    DashboardHandler.store = store
-    server = DashboardHTTPServer((host, port), DashboardHandler)
-    receiver.start()
-    janitor_stop = Event()
-    def trash_janitor() -> None:
-        while not janitor_stop.wait(60):
-            try:
-                result = store.purge_expired_trash()
-                if result["purged"]:
-                    LOGGER.info("Permanently purged expired sessions: %s", ", ".join(result["purged"]))
-            except Exception:
-                LOGGER.exception("Deleted-session expiry check failed")
-    janitor = Thread(target=trash_janitor, name="trash-janitor", daemon=True)
-    janitor.start()
-    LOGGER.info("Apex Engineer: http://%s:%s", host, port)
-    LOGGER.info("Listening for F1 25 UDP telemetry on 0.0.0.0:%s", udp_port)
-    LOGGER.info("Server log: %s", log_path)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        LOGGER.info("Stopping Apex Engineer")
-    finally:
-        store.interrupt_active()
-        janitor_stop.set()
-        janitor.join(timeout=2)
-        receiver.stop()
-        server.server_close()
-        for handler in list(LOGGER.handlers):
-            handler.flush()
-            handler.close()
-            LOGGER.removeHandler(handler)
+    """Compatibility entry point; runtime composition lives in bootstrap."""
+    from .bootstrap import serve as run
+
+    run(port=port, udp_port=udp_port, host=host)

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from collections import Counter
-from io import BytesIO
 import json
+from pathlib import Path
 import re
 from statistics import mean, pstdev
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
+import tempfile
 
 from .analysis import ComparisonError, compare_laps
 from .circuit_profiles import profile_audit
@@ -19,6 +20,11 @@ from .setups import setup_rows
 
 class ExportError(ValueError):
     pass
+
+
+REPORT_NOISE_EVENT_TYPES = {
+    "controller_input", "butn", "speed_trap", "damage_change", "rejected_crossing",
+}
 
 
 def safe_filename(value: str) -> str:
@@ -146,7 +152,7 @@ def _lap_engineering_detail(
         event for event in timeline
         if event.get("lap_number") == lap.number
         and event.get("event_validity", "accepted") == "accepted"
-        and event.get("type") not in {"controller_input", "butn", "speed_trap", "damage_change"}
+        and event.get("type") not in REPORT_NOISE_EVENT_TYPES
         and event.get("player_relevant") is not False
     ]
     scalar_damage = (
@@ -407,7 +413,7 @@ def build_markdown(
         useful_raw = [
             event for event in timeline
             if event.get("player_relevant") is not False
-            and event.get("type") not in {"controller_input", "butn", "speed_trap", "damage_change"}
+            and event.get("type") not in REPORT_NOISE_EVENT_TYPES
         ]
         useful = [event for event in useful_raw if event.get("event_validity", "accepted") == "accepted"]
         hidden_other_cars = sum(event.get("player_relevant") is False for event in timeline)
@@ -482,7 +488,6 @@ def build_markdown(
         key_events = [
             event for event in useful_raw
             if event.get("event_validity") != "superseded"
-            if event.get("type") not in {"controller_input", "butn", "speed_trap", "damage_change"}
         ]
         for event in key_events:
             lines.append(f"- {event.get('session_time', 0):.3f} s · {event.get('type', 'event')} · {event.get('source', 'unknown')} · lap {event.get('lap_number') or '—'} · {event.get('timeline_branch_id', 'unknown branch')}")
@@ -574,25 +579,60 @@ def build_zip(
     timeline: list[dict[str, Any]] | None = None, continuous_data: bytes | None = None,
     scoped_packets: bytes | None = None,
     circuit_profile: dict[str, Any] | None = None,
+    export_revision: dict[str, Any] | None = None,
 ) -> bytes:
-    stream = BytesIO()
-    with ZipFile(stream, "w", ZIP_DEFLATED) as archive:
-        archive.writestr("report.md", report.encode("utf-8"))
-        context = asdict(session)
-        context["lap_ids"] = [lap.id for lap in laps]
-        context["exported_lap_ids"] = [lap.id for lap in laps]
-        archive.writestr("session.json", json.dumps(context, indent=2).encode("utf-8"))
-        if circuit_profile is not None:
-            archive.writestr("circuit-profile.json", json.dumps(circuit_profile, indent=2).encode("utf-8"))
-        if timeline is not None:
-            archive.writestr("race/timeline.json", json.dumps(timeline, indent=2).encode("utf-8"))
-        if continuous_data is not None:
-            archive.writestr("race/race-data.sqlite3", continuous_data)
-        if scoped_packets is not None:
-            archive.writestr("race/selected-packets.jsonl", scoped_packets)
-        for lap in laps:
-            raw = raw_laps.get(lap.id)
-            if raw is None:
-                raise ExportError(f"Original JSON is unavailable for lap {lap.id}")
-            archive.writestr(f"laps/{safe_filename(lap.id)}.json", raw)
-    return stream.getvalue()
+    path = build_zip_file(
+        report, session, laps, raw_laps, timeline, continuous_data,
+        scoped_packets, circuit_profile, export_revision,
+    )
+    try:
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def build_zip_file(
+    report: str, session: Any, laps: list[Any], raw_laps: dict[str, bytes],
+    timeline: list[dict[str, Any]] | None = None, continuous_data: bytes | None = None,
+    scoped_packets: bytes | None = None,
+    circuit_profile: dict[str, Any] | None = None,
+    export_revision: dict[str, Any] | None = None,
+    continuous_path: Path | None = None,
+    raw_lap_paths: dict[str, Path] | None = None,
+) -> Path:
+    """Build a ZIP on disk so the server can stream it without a second archive allocation."""
+    handle = tempfile.NamedTemporaryFile(prefix="apex-export-", suffix=".zip", delete=False)
+    path = Path(handle.name)
+    handle.close()
+    try:
+        with ZipFile(path, "w", ZIP_DEFLATED) as archive:
+            archive.writestr("report.md", report.encode("utf-8"))
+            context = asdict(session)
+            context["lap_ids"] = [lap.id for lap in laps]
+            context["exported_lap_ids"] = [lap.id for lap in laps]
+            archive.writestr("session.json", json.dumps(context, indent=2).encode("utf-8"))
+            if export_revision is not None:
+                archive.writestr("export-revision.json", json.dumps(export_revision, indent=2).encode("utf-8"))
+            if circuit_profile is not None:
+                archive.writestr("circuit-profile.json", json.dumps(circuit_profile, indent=2).encode("utf-8"))
+            if timeline is not None:
+                archive.writestr("race/timeline.json", json.dumps(timeline, indent=2).encode("utf-8"))
+            if continuous_data is not None:
+                archive.writestr("race/race-data.sqlite3", continuous_data)
+            elif continuous_path is not None:
+                archive.write(continuous_path, "race/race-data.sqlite3")
+            if scoped_packets is not None:
+                archive.writestr("race/selected-packets.jsonl", scoped_packets)
+            for lap in laps:
+                raw = raw_laps.get(lap.id)
+                raw_path = (raw_lap_paths or {}).get(lap.id)
+                if raw_path is not None:
+                    archive.write(raw_path, f"laps/{safe_filename(lap.id)}.json")
+                elif raw is not None:
+                    archive.writestr(f"laps/{safe_filename(lap.id)}.json", raw)
+                else:
+                    raise ExportError(f"Original JSON is unavailable for lap {lap.id}")
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return path

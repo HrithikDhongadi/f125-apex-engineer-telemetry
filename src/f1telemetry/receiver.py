@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime, timedelta, timezone
-import json
+from dataclasses import asdict
+from copy import deepcopy
+from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
-import shutil
 import socket
 import sqlite3
 from threading import Event, Lock, Thread
@@ -15,145 +15,56 @@ from typing import Any
 from uuid import uuid4
 
 from .circuits import is_known_track, track_name
-from .circuit_profiles import CircuitProfileError, CircuitProfileStore, profile_identity
+from .circuit_profiles import CircuitProfileStore, profile_identity
+from .application.administration import RuntimeSettingsService, SessionTrashService
+from .application.amendments import SetupAmendmentService
+from .application.archive import OPEN_STATUSES, SessionArchiveRepository
+from .application.comparisons import (
+    ComparisonPolicyError,
+    resolve_comparison_profile,
+)
+from .application.diagnostics import (
+    MAX_DIAGNOSTIC_EVENTS,
+    MAX_DIAGNOSTIC_SEGMENTS,
+    DiagnosticCapture,
+)
+from .application.profiles import CircuitProfileService
+from .application.recorder import RecorderApplicationService
+from .application.exports import (
+    CapturedComparisonExport,
+    capture_session_export,
+    render_comparison_export,
+    render_session_export,
+)
+from .domain.errors import SessionStateError
+from .domain.models import LEGACY_SESSION_ID, Lap, RecordingSession, enrich_lap
+from .domain.recording import (
+    DecisionCode,
+    LapDataObservation,
+    RecorderState,
+    RecordingContext,
+    decide_lap_boundary,
+)
 from .protocol import (
     PACKET_CAR_DAMAGE, PACKET_CAR_SETUPS, PACKET_CAR_STATUS, PACKET_CAR_TELEMETRY,
     PACKET_EVENT, PACKET_FINAL_CLASSIFICATION, PACKET_LAP_DATA, PACKET_MOTION,
-    PACKET_MOTION_EX, PACKET_SESSION, PACKET_SESSION_HISTORY, decode_event, decode_event_code, decode_header,
+    PACKET_MOTION_EX, PACKET_SESSION, PACKET_SESSION_HISTORY, decode_event_code, decode_header,
     decode_packet, decode_player_car_telemetry, decode_player_lap_data, decode_player_setup,
     decode_session, supported_header,
 )
 from .personal_bests import PersonalBestRegistry
-from .quality import lap_quality
 from .race_store import RaceSessionStore
-from .setups import SetupValidationError, setup_rows, validate_manual_values, with_provenance
+from .reports import ExportError
+from .setups import setup_rows, with_provenance
 from .settings import SettingsStore
 
-LEGACY_SESSION_ID = "legacy"
-OPEN_STATUSES = {"armed", "recording"}
 SESSION_UID_REOPEN_GUARD_SECONDS = 5.0
 AUTOMATIC_RECORDING_MODES = {"practice", "qualifying", "race"}
-ONE_SHOT_SESSION_TYPES = {9, 14}
-MAX_DIAGNOSTIC_SEGMENTS = 8
-MAX_DIAGNOSTIC_EVENTS = 50_000
-MAX_DIAGNOSTIC_BYTES = 50 * 1024 * 1024
+TRACE_CACHE_MAX_BYTES = 128 * 1024 * 1024
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-@dataclass
-class Lap:
-    number: int
-    time_ms: int
-    invalid: bool
-    samples: list[dict[str, Any]] = field(default_factory=list)
-    events: list[dict[str, Any]] = field(default_factory=list)
-    setup: dict[str, Any] | None = None
-    saved_at: str = ""
-    sector1_ms: int | None = None
-    sector2_ms: int | None = None
-    first_session_time: float | None = None
-    last_session_time: float | None = None
-    peak_speed_kph: int | None = None
-    minimum_speed_kph: int | None = None
-    max_brake_temps_c: list[int] | None = None
-    max_tyre_inner_c: list[int] | None = None
-    recording_session_id: str = LEGACY_SESSION_ID
-    game_session_uid: int | None = None
-    mode: str = "unknown"
-    track_id: int | None = None
-    track_length_m: int | None = None
-    race_context: dict[str, Any] | None = None
-
-    @property
-    def id(self) -> str:
-        return f"lap-{self.saved_at}-{self.number}"
-
-    def summary(self, note: str = "") -> dict[str, Any]:
-        context = self.race_context if isinstance(self.race_context, dict) else {}
-        start = context.get("start") if isinstance(context.get("start"), dict) else {}
-        finish = context.get("finish") if isinstance(context.get("finish"), dict) else {}
-        start_status = start.get("car_status") if isinstance(start.get("car_status"), dict) else {}
-        finish_status = finish.get("car_status") if isinstance(finish.get("car_status"), dict) else {}
-        start_lap = start.get("lap") if isinstance(start.get("lap"), dict) else {}
-        finish_lap = finish.get("lap") if isinstance(finish.get("lap"), dict) else {}
-        start_session = start.get("session") if isinstance(start.get("session"), dict) else {}
-        start_damage = start.get("damage") if isinstance(start.get("damage"), dict) else {}
-        finish_damage = finish.get("damage") if isinstance(finish.get("damage"), dict) else {}
-        return {
-            "id": self.id, "number": self.number, "time_ms": self.time_ms,
-            "invalid": self.invalid, "sample_count": len(self.samples),
-            "event_count": len(self.events), "events": self.events,
-            "setup": self.setup, "saved_at": self.saved_at,
-            "sector1_ms": self.sector1_ms, "sector2_ms": self.sector2_ms,
-            "first_session_time": self.first_session_time,
-            "last_session_time": self.last_session_time,
-            "peak_speed_kph": self.peak_speed_kph,
-            "minimum_speed_kph": self.minimum_speed_kph,
-            "max_brake_temps_c": self.max_brake_temps_c,
-            "max_tyre_inner_c": self.max_tyre_inner_c, "note": note,
-            "recording_session_id": self.recording_session_id,
-            "game_session_uid": self.game_session_uid, "mode": self.mode,
-            "track_id": self.track_id, "track_length_m": self.track_length_m,
-            "actual_tyre_compound": start_status.get("actual_tyre_compound"),
-            "visual_tyre_compound": start_status.get("visual_tyre_compound"),
-            "tyre_age_laps": start_status.get("tyre_age_laps"),
-            "start_fuel_kg": start_status.get("fuel_kg"),
-            "finish_fuel_kg": finish_status.get("fuel_kg"),
-            "start_position": start_lap.get("position"),
-            "finish_position": finish_lap.get("position"),
-            "grid_position": start_lap.get("grid_position"),
-            "start_pit_stops": start_lap.get("pit_stops"),
-            "finish_pit_stops": finish_lap.get("pit_stops"),
-            "start_penalties_s": start_lap.get("penalties_s"),
-            "finish_penalties_s": finish_lap.get("penalties_s"),
-            "start_warnings": start_lap.get("warnings"),
-            "finish_warnings": finish_lap.get("warnings"),
-            "weather": start_session.get("weather"),
-            "race_total_laps": start_session.get("total_laps"),
-            "finish_result_status": finish_lap.get("result_status"),
-            "track_temperature_c": start_session.get("track_temperature_c"),
-            "air_temperature_c": start_session.get("air_temperature_c"),
-            "start_tyre_wear_pct": start_damage.get("tyre_wear_pct"),
-            "finish_tyre_wear_pct": finish_damage.get("tyre_wear_pct"),
-            "quality": lap_quality(self),
-        }
-
-
-@dataclass
-class RecordingSession:
-    id: str
-    name: str
-    mode: str
-    started_at: str
-    ended_at: str | None
-    status: str
-    game_session_uid: int | None
-    track_id: int | None
-    track_length_m: int | None
-    lap_ids: list[str] = field(default_factory=list)
-    game_session_type: int | None = None
-    game_session_name: str | None = None
-    track_name_override: str | None = None
-    packet_format: int = 2025
-    sector2_start_m: float | None = None
-    sector3_start_m: float | None = None
-    circuit_profile_id: str | None = None
-    race_store_file: str | None = None
-    final_classification: dict[str, Any] | None = None
-
-    def summary(self, laps: list[Lap]) -> dict[str, Any]:
-        valid = [lap.time_ms for lap in laps if not lap.invalid]
-        return {
-            **asdict(self), "lap_count": len(laps),
-            "best_valid_lap_ms": min(valid) if valid else None,
-            "track_name": track_name(self.track_id, self.track_name_override),
-            "official_track_name": track_name(self.track_id) if is_known_track(self.track_id) else None,
-            "can_override_track_name": not is_known_track(self.track_id),
-            "read_only": self.id == LEGACY_SESSION_ID,
-        }
 
 
 def _positive(value: Any) -> int | None:
@@ -164,44 +75,28 @@ def _positive(value: Any) -> int | None:
         return None
 
 
-def _wheel_max(samples: list[dict[str, Any]], key: str) -> list[int] | None:
-    rows = [values for sample in samples if isinstance((values := sample.get(key)), (list, tuple)) and len(values) == 4]
-    return [max(int(row[index]) for row in rows) for index in range(4)] if rows else None
-
-
-def enrich_lap(lap: Lap) -> Lap:
-    speeds = [int(sample["speed_kph"]) for sample in lap.samples if sample.get("speed_kph") is not None]
-    times = [float(sample["t"]) for sample in lap.samples if sample.get("t") is not None]
-    if lap.first_session_time is None and times:
-        lap.first_session_time = min(times)
-    if lap.last_session_time is None and times:
-        lap.last_session_time = max(times)
-    if lap.peak_speed_kph is None and speeds:
-        lap.peak_speed_kph = max(speeds)
-    if lap.minimum_speed_kph is None and speeds:
-        lap.minimum_speed_kph = min(speeds)
-    if lap.max_brake_temps_c is None:
-        lap.max_brake_temps_c = _wheel_max(lap.samples, "brake_temps_c")
-    if lap.max_tyre_inner_c is None:
-        lap.max_tyre_inner_c = _wheel_max(lap.samples, "tyre_inner_c")
-    return lap
-
-
-class SessionStateError(ValueError):
-    pass
-
-
 class SessionStore:
     def __init__(self, capture_dir: Path) -> None:
         self.capture_dir = capture_dir
         self.capture_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir = self.capture_dir / "sessions"
         self.sessions_dir.mkdir(exist_ok=True)
-        self.notes_path = self.capture_dir / "notes.json"
+        self.archive = SessionArchiveRepository(self.capture_dir)
+        self.notes_path = self.archive.notes_path
         self.settings_store = SettingsStore(self.capture_dir / "settings.json")
         self.settings = self.settings_store.load()
         self.pb_registry = PersonalBestRegistry(self.capture_dir / "personal_bests")
         self.profile_store = CircuitProfileStore(self.capture_dir / "circuit_profiles")
+        self.profile_service = CircuitProfileService(self.profile_store, self.archive)
+        self.trash_service = SessionTrashService(self.archive, utc_now)
+        self.settings_service = RuntimeSettingsService(self.settings_store, self.trash_service)
+        self.amendment_service = SetupAmendmentService(self.archive, self.pb_registry, utc_now)
+        self.diagnostics = DiagnosticCapture(
+            self.capture_dir,
+            lambda: int(self.settings["diagnostic_max_mb"]),
+            lambda: MAX_DIAGNOSTIC_EVENTS,
+            lambda: MAX_DIAGNOSTIC_SEGMENTS,
+        )
         self.lock = Lock()
         self.latest: dict[str, Any] = {"connected": False}
         self.last_packet_at: float | None = None
@@ -209,6 +104,12 @@ class SessionStore:
         self.sessions: dict[str, RecordingSession] = {}
         self.session_laps: dict[str, list[Lap]] = {}
         self.laps: list[Lap] = []
+        self.lap_by_id: dict[str, Lap] = {}
+        self.session_lap_ids: dict[str, list[str]] = {}
+        self.lap_summary_cache: dict[str, dict[str, Any]] = {}
+        self.session_summary_cache: dict[str, dict[str, Any]] = {}
+        self.trace_cache: OrderedDict[str, tuple[Lap, int]] = OrderedDict()
+        self.trace_cache_bytes = 0
         self.game_session_uid: int | None = None
         self.game_mode = "unknown"
         self.game_session_type: int | None = None
@@ -221,94 +122,156 @@ class SessionStore:
         self.manual_stop_session_key: tuple[int, int] | None = None
         self.session_uid_reopen_guard: dict[int, float] = {}
         self.current_setup: dict[str, Any] | None = None
-        self.active_lap_number: int | None = None
-        self.active_invalid = False
-        self.active_samples: list[dict[str, Any]] = []
-        self.active_lap_events: list[dict[str, Any]] = []
-        self.pending_restart_event: dict[str, Any] | None = None
-        self.active_lap_state: dict[str, Any] = {}
-        self.active_lap_setup: dict[str, Any] | None = None
-        self.capture_current_lap = False
+        self.recorder_state = RecorderState()
+        self.recorder_service = RecorderApplicationService()
         self.race_store: RaceSessionStore | None = None
         self.packet_state: dict[int, dict[str, Any]] = {}
-        self.active_lap_context: dict[str, Any] | None = None
-        self.diagnostics_enabled = False
-        self.diagnostic_path: Path | None = None
-        self.diagnostic_segment = -1
-        self.diagnostic_events = 0
-        self.diagnostic_bytes = 0
-        self.diagnostic_truncated = False
         self._purge_expired_trash_unlocked()
         self._load_all()
 
+    # Temporary compatibility façade while callers migrate to RecorderState.
+    # The state object is authoritative; these names preserve the established
+    # SessionStore/test API without maintaining duplicate mutable state.
+    @property
+    def active_lap_number(self) -> int | None:
+        return self.recorder_state.active_lap_number
+
+    @active_lap_number.setter
+    def active_lap_number(self, value: int | None) -> None:
+        self.recorder_state.active_lap_number = value
+
+    @property
+    def active_invalid(self) -> bool:
+        return self.recorder_state.invalid
+
+    @active_invalid.setter
+    def active_invalid(self, value: bool) -> None:
+        self.recorder_state.invalid = value
+
+    @property
+    def active_samples(self) -> list[dict[str, Any]]:
+        return self.recorder_state.samples
+
+    @active_samples.setter
+    def active_samples(self, value: list[dict[str, Any]]) -> None:
+        self.recorder_state.samples = value
+
+    @property
+    def active_lap_events(self) -> list[dict[str, Any]]:
+        return self.recorder_state.events
+
+    @active_lap_events.setter
+    def active_lap_events(self, value: list[dict[str, Any]]) -> None:
+        self.recorder_state.events = value
+
+    @property
+    def pending_restart_event(self) -> dict[str, Any] | None:
+        return self.recorder_state.pending_restart_event
+
+    @pending_restart_event.setter
+    def pending_restart_event(self, value: dict[str, Any] | None) -> None:
+        self.recorder_state.pending_restart_event = value
+
+    @property
+    def active_lap_state(self) -> dict[str, Any]:
+        return self.recorder_state.lap_packet
+
+    @active_lap_state.setter
+    def active_lap_state(self, value: dict[str, Any]) -> None:
+        self.recorder_state.lap_packet = value
+
+    @property
+    def active_lap_setup(self) -> dict[str, Any] | None:
+        return self.recorder_state.setup
+
+    @active_lap_setup.setter
+    def active_lap_setup(self, value: dict[str, Any] | None) -> None:
+        self.recorder_state.setup = value
+
+    @property
+    def active_lap_context(self) -> dict[str, Any] | None:
+        return self.recorder_state.race_context
+
+    @active_lap_context.setter
+    def active_lap_context(self, value: dict[str, Any] | None) -> None:
+        self.recorder_state.race_context = value
+
+    @property
+    def capture_current_lap(self) -> bool:
+        return self.recorder_state.capture_current_lap
+
+    @capture_current_lap.setter
+    def capture_current_lap(self, value: bool) -> None:
+        self.recorder_state.capture_current_lap = value
+
     def _load_notes(self) -> dict[str, str]:
-        try:
-            payload = json.loads(self.notes_path.read_text(encoding="utf-8"))
-            return {str(key): str(value) for key, value in payload.items()}
-        except (OSError, ValueError, TypeError):
-            return {}
+        return self.archive.load_notes()
 
     @staticmethod
     def _lap_from_payload(payload: dict[str, Any], defaults: dict[str, Any] | None = None) -> Lap:
-        allowed = {item.name for item in fields(Lap)}
-        values = dict(defaults or {})
-        values.update({key: value for key, value in payload.items() if key in allowed})
-        return enrich_lap(Lap(**values))
+        return SessionArchiveRepository.lap_from_payload(payload, defaults)
 
     def _load_all(self) -> None:
-        legacy_laps: list[Lap] = []
-        for path in sorted(self.capture_dir.glob("lap-*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                legacy_laps.append(self._lap_from_payload(payload, {"recording_session_id": LEGACY_SESSION_ID}))
-            except (OSError, ValueError, TypeError, KeyError):
-                continue
-        self.sessions[LEGACY_SESSION_ID] = RecordingSession(
-            LEGACY_SESSION_ID, "Legacy captures", "unknown", "", None, "legacy", None, None, None,
-            [lap.id for lap in legacy_laps],
-        )
-        self.session_laps[LEGACY_SESSION_ID] = legacy_laps
-
-        session_fields = {item.name for item in fields(RecordingSession)}
-        for metadata_path in sorted(self.sessions_dir.glob("*/session.json")):
-            try:
-                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-                session = RecordingSession(**{key: value for key, value in payload.items() if key in session_fields})
-                laps = []
-                for lap_path in sorted(metadata_path.parent.glob("lap-*.json")):
-                    lap_payload = json.loads(lap_path.read_text(encoding="utf-8"))
-                    defaults = {
-                        "recording_session_id": session.id, "game_session_uid": session.game_session_uid,
-                        "mode": session.mode, "track_id": session.track_id, "track_length_m": session.track_length_m,
-                    }
-                    laps.append(self._lap_from_payload(lap_payload, defaults))
-                session.lap_ids = [lap.id for lap in laps]
-                if session.status in OPEN_STATUSES:
-                    session.status, session.ended_at = "interrupted", utc_now()
-                    self.sessions[session.id] = session
-                    self.session_laps[session.id] = laps
-                    self._persist_session(session)
-                else:
-                    self.sessions[session.id] = session
-                    self.session_laps[session.id] = laps
-            except (OSError, ValueError, TypeError, KeyError):
-                continue
-        self._refresh_lap_index()
-        real_sessions = [session for session in self.sessions.values() if session.id != LEGACY_SESSION_ID]
-        if real_sessions:
-            self.selected_session_id = max(real_sessions, key=lambda item: item.started_at).id
-        else:
-            self.selected_session_id = LEGACY_SESSION_ID
+        contents = self.archive.load(mark_open_interrupted=True, interrupted_at=utc_now, lazy_traces=True)
+        self.sessions = contents.sessions
+        self.session_laps = contents.session_laps
+        self.laps = contents.laps
+        self._rebuild_lap_indexes()
+        self.selected_session_id = contents.selected_session_id
 
     def _refresh_lap_index(self) -> None:
         self.laps = [lap for laps in self.session_laps.values() for lap in laps]
+        self._rebuild_lap_indexes()
+
+    def _rebuild_lap_indexes(self) -> None:
+        self.lap_by_id = {lap.id: lap for lap in self.laps}
+        self.session_lap_ids = {
+            session_id: [lap.id for lap in laps]
+            for session_id, laps in self.session_laps.items()
+        }
+        self.lap_summary_cache.clear()
+        self.session_summary_cache.clear()
+        self.trace_cache.clear()
+        self.trace_cache_bytes = 0
+
+    def _invalidate_lap(self, lap: Lap) -> None:
+        self.lap_summary_cache.pop(lap.id, None)
+        self.session_summary_cache.pop(lap.recording_session_id, None)
+        cached = self.trace_cache.pop(lap.id, None)
+        if cached:
+            self.trace_cache_bytes -= cached[1]
+
+    def _lap_summary(self, lap: Lap) -> dict[str, Any]:
+        cached = self.lap_summary_cache.get(lap.id)
+        note = self.notes.get(lap.id, "")
+        if cached is None or cached.get("note") != note:
+            cached = lap.summary(note)
+            self.lap_summary_cache[lap.id] = cached
+        return dict(cached)
+
+    def _hydrate_lap(self, lap: Lap) -> Lap:
+        if lap.samples:
+            return lap
+        cached = self.trace_cache.pop(lap.id, None)
+        if cached is not None:
+            self.trace_cache[lap.id] = cached
+            return cached[0]
+        hydrated = self.archive.load_full_lap(lap)
+        try:
+            size = self.archive.lap_path(lap).stat().st_size
+        except OSError:
+            size = len(hydrated.samples) * 256
+        while self.trace_cache and self.trace_cache_bytes + size > TRACE_CACHE_MAX_BYTES:
+            _key, (_old_lap, old_size) = self.trace_cache.popitem(last=False)
+            self.trace_cache_bytes -= old_size
+        if size <= TRACE_CACHE_MAX_BYTES:
+            self.trace_cache[lap.id] = (hydrated, size)
+            self.trace_cache_bytes += size
+        return hydrated
 
     def _persist_session(self, session: RecordingSession) -> None:
-        directory = self.sessions_dir / session.id
-        directory.mkdir(parents=True, exist_ok=True)
-        temporary = directory / "session.json.tmp"
-        temporary.write_text(json.dumps(asdict(session), indent=2), encoding="utf-8")
-        temporary.replace(directory / "session.json")
+        self.session_summary_cache.pop(session.id, None)
+        self.archive.persist_session(session)
 
     def _touch(self) -> None:
         self.latest["connected"] = True
@@ -463,12 +426,8 @@ class SessionStore:
             {"status": session.status, "capture_current_lap": self.capture_current_lap},
             "recorder", self.active_lap_number,
         )
-        if self.diagnostics_enabled:
-            self.diagnostic_path = None
-            self.diagnostic_segment = -1
-            self.diagnostic_events = 0
-            self.diagnostic_bytes = 0
-            self.diagnostic_truncated = False
+        if self.diagnostics.enabled:
+            self.diagnostics.reset_recording()
             self._start_diagnostic_segment("run-start")
             self._write_diagnostic({
                 "event": "recording_started", "timestamp_utc": self._diagnostic_timestamp(),
@@ -482,29 +441,15 @@ class SessionStore:
 
     @staticmethod
     def _diagnostic_timestamp() -> str:
-        return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        return DiagnosticCapture.timestamp()
 
     def diagnostic_status(self) -> dict[str, Any]:
-        return {
-            "enabled": self.diagnostics_enabled,
-            "active_file": str(self.diagnostic_path.relative_to(self.capture_dir)) if self.diagnostic_path else None,
-            "segment": self.diagnostic_segment if self.diagnostic_path else None,
-            "events": self.diagnostic_events,
-            "bytes": self.diagnostic_bytes,
-            "truncated": self.diagnostic_truncated,
-            "limits": {
-                "segments": MAX_DIAGNOSTIC_SEGMENTS,
-                "events_per_segment": MAX_DIAGNOSTIC_EVENTS,
-                "bytes_per_segment": int(self.settings["diagnostic_max_mb"]) * 1024 * 1024,
-            },
-        }
+        return self.diagnostics.status()
 
     def configure_diagnostics(self, enabled: bool) -> dict[str, Any]:
         with self.lock:
-            self.diagnostics_enabled = bool(enabled)
-            if not self.diagnostics_enabled:
-                self.diagnostic_path = None
-            elif self.active_recording_id is not None and self.diagnostic_path is None:
+            self.diagnostics.set_enabled(enabled)
+            if self.diagnostics.enabled and self.active_recording_id is not None and self.diagnostics.path is None:
                 self._start_diagnostic_segment("manual-enable")
                 self._write_diagnostic({
                     "event": "diagnostics_enabled", "timestamp_utc": self._diagnostic_timestamp(),
@@ -517,39 +462,10 @@ class SessionStore:
             return self.diagnostic_status()
 
     def _start_diagnostic_segment(self, reason: str) -> None:
-        if not self.diagnostics_enabled or self.active_recording_id is None:
-            return
-        next_segment = self.diagnostic_segment + 1
-        if next_segment >= MAX_DIAGNOSTIC_SEGMENTS:
-            self.diagnostic_truncated = True
-            return
-        self.diagnostic_segment = next_segment
-        self.diagnostic_events = 0
-        self.diagnostic_bytes = 0
-        self.diagnostic_truncated = False
-        directory = self.sessions_dir / self.active_recording_id / "diagnostics"
-        directory.mkdir(parents=True, exist_ok=True)
-        safe_reason = "".join(character if character.isalnum() or character == "-" else "-" for character in reason)
-        self.diagnostic_path = directory / f"lap-data-{next_segment:02d}-{safe_reason}.jsonl"
+        self.diagnostics.start_segment(self.active_recording_id, reason)
 
     def _write_diagnostic(self, event: dict[str, Any]) -> None:
-        if not self.diagnostics_enabled or self.active_recording_id is None or self.diagnostic_path is None or self.diagnostic_truncated:
-            return
-        line = (json.dumps(event, separators=(",", ":")) + "\n").encode("utf-8")
-        diagnostic_max_bytes = int(self.settings["diagnostic_max_mb"]) * 1024 * 1024
-        if self.diagnostic_events >= MAX_DIAGNOSTIC_EVENTS or self.diagnostic_bytes + len(line) > diagnostic_max_bytes:
-            self.diagnostic_truncated = True
-            marker = json.dumps({
-                "event": "diagnostic_limit_reached", "timestamp_utc": self._diagnostic_timestamp(),
-                "events": self.diagnostic_events, "bytes": self.diagnostic_bytes,
-            }, separators=(",", ":")) + "\n"
-            with self.diagnostic_path.open("ab") as stream:
-                stream.write(marker.encode("utf-8"))
-            return
-        with self.diagnostic_path.open("ab") as stream:
-            stream.write(line)
-        self.diagnostic_events += 1
-        self.diagnostic_bytes += len(line)
+        self.diagnostics.write(self.active_recording_id, event)
 
     def start_time_trial_run(self, name: str) -> dict[str, Any]:
         with self.lock:
@@ -617,39 +533,13 @@ class SessionStore:
         """Remove a closed session from the library by atomically moving it to local trash."""
         with self.lock:
             session = self.sessions.get(session_id)
-            if session is None:
-                raise SessionStateError("Unknown session ID")
-            if not confirmed:
-                raise SessionStateError("Session deletion must be explicitly confirmed")
-            if session.id == LEGACY_SESSION_ID:
-                raise SessionStateError("Legacy captures cannot be deleted")
-            if session.id == self.active_recording_id or session.status in OPEN_STATUSES:
-                raise SessionStateError("Stop the active recording before deleting this session")
-
-            source = self.sessions_dir / session.id
-            if not source.is_dir():
-                raise SessionStateError("Session directory is unavailable; nothing was deleted")
-            trash_dir = self.capture_dir / "trash" / "sessions"
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            destination = trash_dir / f"{session.id}--deleted-{stamp}-{uuid4().hex[:8]}"
-            try:
-                trash_dir.mkdir(parents=True, exist_ok=True)
-                source.replace(destination)
-            except OSError as error:
-                raise SessionStateError("Could not move the session to local trash") from error
-            try:
-                self._atomic_json(destination / "deletion.json", {
-                    "deleted_at": utc_now(),
-                    "original_path": str(Path("sessions") / session.id),
-                    "session": asdict(session),
-                    "lap_ids": [lap.id for lap in self.session_laps.get(session.id, [])],
-                    "personal_bests_preserved": True,
-                    "notes_preserved": True,
-                })
-            except OSError as error:
-                destination.replace(source)
-                raise SessionStateError("Could not create a recoverable deletion record") from error
-
+            result = self.trash_service.delete(
+                session,
+                self.session_laps.get(session_id, []),
+                active_recording_id=self.active_recording_id,
+                confirmed=confirmed,
+            )
+            assert session is not None
             self.sessions.pop(session.id)
             self.session_laps.pop(session.id, None)
             self._refresh_lap_index()
@@ -659,101 +549,28 @@ class SessionStore:
                     max(remaining, key=lambda item: item.started_at).id
                     if remaining else LEGACY_SESSION_ID
                 )
-            return {
-                "deleted_session_id": session.id,
-                "recoverable": True,
-                "moved_to": str(destination.relative_to(self.capture_dir)),
-                "selected_session_id": self.selected_session_id,
-                "personal_bests_preserved": True,
-                "notes_preserved": True,
-            }
-
-    @staticmethod
-    def _parse_utc(value: Any) -> datetime | None:
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            return None
+            result["selected_session_id"] = self.selected_session_id
+            return result
 
     def list_deleted_sessions(self) -> list[dict[str, Any]]:
-        trash_dir = self.capture_dir / "trash" / "sessions"
-        retention = int(self.settings["trash_retention_days"])
-        result = []
-        for path in sorted(trash_dir.glob("*"), reverse=True) if trash_dir.exists() else []:
-            if not path.is_dir():
-                continue
-            try:
-                deletion = json.loads((path / "deletion.json").read_text(encoding="utf-8"))
-                session = deletion.get("session") or json.loads((path / "session.json").read_text(encoding="utf-8"))
-                deleted_at = self._parse_utc(deletion.get("deleted_at"))
-                if deleted_at is None:
-                    deleted_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-                purge_at = deleted_at + timedelta(days=retention) if retention else None
-                result.append({
-                    "trash_id": path.name, "session_id": session.get("id"),
-                    "name": session.get("name", session.get("id", path.name)),
-                    "mode": session.get("mode", "unknown"), "track_id": session.get("track_id"),
-                    "started_at": session.get("started_at"), "deleted_at": deleted_at.isoformat().replace("+00:00", "Z"),
-                    "purge_at": purge_at.isoformat().replace("+00:00", "Z") if purge_at else None,
-                    "lap_count": len(deletion.get("lap_ids") or session.get("lap_ids") or []),
-                })
-            except (OSError, ValueError, TypeError):
-                continue
-        return result
+        return self.trash_service.list(int(self.settings["trash_retention_days"]))
 
     def restore_deleted_session(self, trash_id: str, confirmed: bool = False) -> dict[str, Any]:
         if not confirmed:
             raise SessionStateError("Session restoration must be explicitly confirmed")
-        if not trash_id or Path(trash_id).name != trash_id:
-            raise SessionStateError("Invalid deleted-session ID")
         with self.lock:
-            source = self.capture_dir / "trash" / "sessions" / trash_id
-            if not source.is_dir():
-                raise SessionStateError("Deleted session was not found; it may already have expired")
-            try:
-                payload = json.loads((source / "session.json").read_text(encoding="utf-8"))
-                session_fields = {item.name for item in fields(RecordingSession)}
-                session = RecordingSession(**{key: value for key, value in payload.items() if key in session_fields})
-            except (OSError, ValueError, TypeError, KeyError) as error:
-                raise SessionStateError("Deleted session metadata is unreadable") from error
-            destination = self.sessions_dir / session.id
-            if destination.exists() or session.id in self.sessions:
-                raise SessionStateError(f"Cannot restore: session {session.id} already exists")
-            source.replace(destination)
-            try:
-                laps = []
-                for lap_path in sorted(destination.glob("lap-*.json")):
-                    lap_payload = json.loads(lap_path.read_text(encoding="utf-8"))
-                    laps.append(self._lap_from_payload(lap_payload, {
-                        "recording_session_id": session.id, "game_session_uid": session.game_session_uid,
-                        "mode": session.mode, "track_id": session.track_id, "track_length_m": session.track_length_m,
-                    }))
-                session.lap_ids = [lap.id for lap in laps]
-                self.sessions[session.id], self.session_laps[session.id] = session, laps
-                self.selected_session_id = session.id
-                self._refresh_lap_index()
-            except (OSError, ValueError, TypeError, KeyError) as error:
-                destination.replace(source)
-                raise SessionStateError("Could not load the restored session") from error
+            session, laps = self.trash_service.restore(
+                trash_id,
+                confirmed=confirmed,
+                existing_session_ids=set(self.sessions),
+            )
+            self.sessions[session.id], self.session_laps[session.id] = session, laps
+            self.selected_session_id = session.id
+            self._refresh_lap_index()
             return {"restored_session_id": session.id, "selected_session_id": session.id, "lap_count": len(laps)}
 
     def _purge_expired_trash_unlocked(self) -> dict[str, Any]:
-        retention = int(self.settings.get("trash_retention_days", 30))
-        if retention == 0:
-            return {"purged": [], "retention_days": 0}
-        cutoff = datetime.now(timezone.utc) - timedelta(days=retention)
-        purged = []
-        trash_dir = self.capture_dir / "trash" / "sessions"
-        for item in self.list_deleted_sessions():
-            deleted_at = self._parse_utc(item.get("deleted_at"))
-            if deleted_at is None or deleted_at > cutoff:
-                continue
-            target = trash_dir / item["trash_id"]
-            if target.is_dir() and target.parent == trash_dir:
-                shutil.rmtree(target)
-                purged.append(item["trash_id"])
-        return {"purged": purged, "retention_days": retention}
+        return self.trash_service.purge_expired(int(self.settings.get("trash_retention_days", 30)))
 
     def purge_expired_trash(self) -> dict[str, Any]:
         with self.lock:
@@ -761,11 +578,8 @@ class SessionStore:
 
     def update_settings(self, values: Any) -> dict[str, Any]:
         with self.lock:
-            previous = dict(self.settings)
-            self.settings = self.settings_store.save(values)
-            purge = self._purge_expired_trash_unlocked()
-            restart_fields = [key for key in ("web_host", "web_port", "udp_port") if previous.get(key) != self.settings.get(key)]
-            return {"settings": dict(self.settings), "restart_required": restart_fields, "purge": purge}
+            self.settings, result = self.settings_service.update(self.settings, values)
+            return result
 
     def override_track_name(self, session_id: str, name: str) -> dict[str, Any]:
         with self.lock:
@@ -814,25 +628,7 @@ class SessionStore:
             self._touch()
 
     def _reset_lap(self) -> None:
-        self.active_lap_number = None
-        self.active_invalid = False
-        self.active_samples = []
-        self.active_lap_events = []
-        self.pending_restart_event = None
-        self.active_lap_state = {}
-        self.active_lap_setup = None
-        self.active_lap_context = None
-        self.capture_current_lap = False
-
-    def _begin_lap(self, lap_number: int, capture: bool) -> None:
-        self.active_lap_number = lap_number
-        self.active_invalid = False
-        self.active_samples = []
-        self.active_lap_events = []
-        self.active_lap_state = {}
-        self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
-        self.active_lap_context = self._current_race_context()
-        self.capture_current_lap = capture
+        self.recorder_state.reset()
 
     def _current_race_context(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -850,6 +646,12 @@ class SessionStore:
         session_uid: int | None = None,
         packet_meta: dict[str, Any] | None = None,
     ) -> None:
+        """Apply one normalized Lap Data observation under the existing lock.
+
+        The domain engine decides boundaries before this coordinator performs
+        ordered persistence, active-buffer mutation, timeline and diagnostic
+        effects. Packet dispatch order outside this method is unchanged.
+        """
         with self.lock:
             self._observe_uid(session_uid)
             previous_packet = dict(self.active_lap_state)
@@ -858,271 +660,52 @@ class SessionStore:
             samples_before = len(self.active_samples)
             active_session = self.sessions.get(self.active_recording_id or "")
             status_before = active_session.status if active_session else None
-            reasons: list[str] = []
-            decision = "observe"
-            flags: dict[str, Any] = {}
-            lap_number = int(lap_state["lap_number"])
-            if self.active_lap_number is None:
-                packet_session_time = (packet_meta or {}).get("session_time")
-                session_opening_start = bool(
-                    active_session is not None
-                    and (
-                        active_session.mode == "race"
-                        or active_session.game_session_type in ONE_SHOT_SESSION_TYPES
-                    )
-                    and active_session.status == "armed"
-                    and lap_number == 1
-                    and int(lap_state.get("last_lap_ms", 0)) == 0
-                    and int(lap_state.get("current_lap_ms", 0)) <= 1_500
-                    and isinstance(packet_session_time, (int, float))
-                    and 0 <= float(packet_session_time) <= 5
-                )
-                self._begin_lap(lap_number, session_opening_start)
-                flags = {
-                    "session_opening_start": session_opening_start,
-                    "race_grid_start": session_opening_start and active_session is not None and active_session.mode == "race",
-                    "one_shot_qualifying_start": session_opening_start and active_session is not None and active_session.game_session_type in ONE_SHOT_SESSION_TYPES,
-                }
-                if session_opening_start:
+            observation = LapDataObservation.from_packet(lap_state, session_uid, packet_meta)
+            context = RecordingContext(
+                recording_session_id=self.active_recording_id,
+                mode=active_session.mode if active_session else None,
+                game_session_type=active_session.game_session_type if active_session else None,
+                status=active_session.status if active_session else None,
+                track_length_m=self.track_length_m,
+            )
+            plan = decide_lap_boundary(self.recorder_state, observation, context)
+
+            if self.diagnostics.enabled and plan.diagnostic_segment:
+                self._start_diagnostic_segment(plan.diagnostic_segment)
+
+            def mark_session_recording() -> None:
+                if active_session is not None:
                     active_session.status = "recording"
                     self._persist_session(active_session)
-                    decision = "start_capture"
-                    reasons.append(
-                        "verified_race_grid_start"
-                        if active_session.mode == "race"
-                        else "verified_one_shot_qualifying_start"
-                    )
-                else:
-                    # With no earlier Lap Data there is no proof that this is
-                    # the beginning of a full lap. Stay armed until a crossing.
-                    decision = "initial_observation"
-                    reasons.append("no_previous_lap_packet_so_full_lap_start_is_unproven")
-            else:
-                old_number = self.active_lap_number
-                old_time = self.active_lap_state.get("current_lap_ms")
-                old_distance = self.active_lap_state.get("lap_distance_m")
-                new_time = int(lap_state.get("current_lap_ms", 0))
-                new_distance = float(lap_state.get("lap_distance_m", 0))
-                track_length = float(self.track_length_m or 0)
-                time_reversed = old_time is not None and new_time + 1_000 < int(old_time)
-                distance_reversed = old_distance is not None and new_distance + 50 < float(old_distance)
-                lap_number_reversed = lap_number < old_number
-                near_line = new_time <= 5_000 and -200 <= new_distance <= max(250, track_length * 0.05)
-                forward_number = lap_number > old_number
-                old_total_distance = self.active_lap_state.get("total_distance_m")
-                new_total_distance = lap_state.get("total_distance_m")
-                total_distance_step = (
-                    float(new_total_distance) - float(old_total_distance)
-                    if old_total_distance is not None and new_total_distance is not None else None
-                )
-                total_distance_reversed = bool(
-                    total_distance_step is not None and total_distance_step < -50
-                )
-                continuous_forward_distance = bool(
-                    total_distance_step is not None
-                    and -5 <= total_distance_step <= max(250, track_length * 0.05)
-                )
-                timed_same_number_wrap = bool(
-                    old_time is not None and int(old_time) > 0
-                    and new_time + 1_000 < int(old_time)
-                )
-                untimed_approach_wrap = bool(
-                    old_time is not None and int(old_time) == 0
-                    and 0 <= new_time <= 5_000
-                )
-                wrapped_same_number = bool(
-                    lap_number == old_number
-                    and track_length > 100
-                    and old_distance is not None
-                    and float(old_distance) >= track_length * 0.85
-                    and new_distance <= track_length * 0.05
-                    and continuous_forward_distance
-                    and (timed_same_number_wrap or untimed_approach_wrap)
-                )
-                crossed_from_negative = bool(
-                    lap_number == old_number
-                    and old_distance is not None
-                    and -200 <= float(old_distance) < 0 <= new_distance
-                    and new_time <= 5_000
-                )
-                reset_to_start = bool(
-                    lap_number <= old_number
-                    and (time_reversed or distance_reversed or total_distance_reversed)
-                    and old_distance is not None
-                    and float(old_distance) > max(250, track_length * 0.05)
-                    and not continuous_forward_distance
-                    and new_time <= 5_000
-                    and -200 <= new_distance <= 100
-                )
-                restart_lap_started = reset_to_start and new_distance >= 0
-                restart_approach = bool(
-                    lap_number <= old_number
-                    and total_distance_reversed
-                    and new_time <= 5_000
-                )
-                crossed_start_line = near_line and (forward_number or wrapped_same_number or crossed_from_negative)
-                new_lap_started = crossed_start_line or restart_lap_started
-                if self.diagnostics_enabled and (reset_to_start or restart_approach):
-                    self._start_diagnostic_segment("restart-lap")
-                elif self.diagnostics_enabled and (
-                    lap_number_reversed
-                    or ((time_reversed or distance_reversed or total_distance_reversed) and not new_lap_started)
-                ):
-                    self._start_diagnostic_segment(
-                        "lap-number-rewind" if lap_number_reversed else "time-distance-rewind"
-                    )
-                completed_lap_available = crossed_start_line and int(lap_state.get("last_lap_ms", 0)) >= 30_000
-                flags = {
-                    "near_line": near_line, "forward_number": forward_number,
-                    "wrapped_same_number": wrapped_same_number,
-                    "timed_same_number_wrap": timed_same_number_wrap,
-                    "untimed_approach_wrap": untimed_approach_wrap,
-                    "total_distance_step_m": total_distance_step,
-                    "total_distance_reversed": total_distance_reversed,
-                    "continuous_forward_distance": continuous_forward_distance,
-                    "crossed_from_negative": crossed_from_negative,
-                    "reset_to_start": reset_to_start,
-                    "restart_lap_started": restart_lap_started,
-                    "restart_approach": restart_approach,
-                    "new_lap_started": new_lap_started,
-                    "completed_lap_available": completed_lap_available,
-                }
 
-                if completed_lap_available and self.capture_current_lap:
-                    saved, finish_reason = self._finish_lap(int(lap_state["last_lap_ms"]))
-                    decision = "finish_saved" if saved else "finish_rejected"
-                    reasons.append(finish_reason)
-                elif crossed_start_line and self.capture_current_lap:
-                    reasons.append("crossing_has_no_official_completed_lap_time")
-                if new_lap_started and self.active_recording_id is not None:
-                    session = self.sessions[self.active_recording_id]
-                    if session.status == "armed":
-                        session.status = "recording"
-                        self._persist_session(session)
-                    capture = session.status == "recording"
-                    start_kind = (
-                        "restart_at_lap_start" if restart_lap_started
-                        else "lap_number_advanced" if forward_number
-                        else "same_number_wrap" if wrapped_same_number
-                        else "negative_distance_crossing"
-                    )
-                    reasons.append(f"verified_start_{start_kind}")
-                    if capture:
-                        decision = f"{decision}_and_start_capture" if decision.startswith("finish_") else "start_capture"
-                else:
-                    capture = False
-                    if forward_number and not near_line:
-                        reasons.append("rejected_crossing_lap_number_advanced_but_time_or_distance_not_near_line")
-                        decision = "rejected_crossing"
-                    elif near_line and not (forward_number or wrapped_same_number or crossed_from_negative):
-                        reasons.append("rejected_crossing_near_line_without_transition_evidence")
-                if lap_number != old_number or new_lap_started:
-                    if lap_number != old_number and not new_lap_started:
-                        reasons.append("active_lap_changed_without_verified_crossing_capture_disabled")
-                        if lap_number_reversed:
-                            reasons.append("discard_lap_number_decreased_probable_restart_or_flashback")
-                            decision = "discard_partial_lap"
-                    self._begin_lap(lap_number, capture)
-                    restart_event = {
-                        "type": "restart_lap", "session_time": (packet_meta or {}).get("session_time"),
-                        "frame_identifier": (packet_meta or {}).get("frame_identifier"),
-                        "from_lap_time_ms": old_time, "to_lap_time_ms": new_time,
-                        "from_lap_distance_m": old_distance, "to_lap_distance_m": new_distance,
-                        "game_invalid": bool(lap_state.get("invalid", False)),
-                    }
-                    if restart_lap_started:
-                        self.active_lap_events.append(restart_event)
-                        self.pending_restart_event = None
-                    elif reset_to_start:
-                        self.pending_restart_event = restart_event
-                    elif crossed_start_line and capture and self.pending_restart_event is not None:
-                        self.active_lap_events.append(self.pending_restart_event)
-                        self.pending_restart_event = None
-                else:
-                    if time_reversed or distance_reversed or total_distance_reversed:
-                        if restart_approach:
-                            prior_event = self.active_lap_events[-1] if self.active_lap_events else None
-                            restart_event = {
-                                "type": "restart_lap", "session_time": (packet_meta or {}).get("session_time"),
-                                "frame_identifier": (packet_meta or {}).get("frame_identifier"),
-                                "from_lap_time_ms": (
-                                    prior_event.get("from_lap_time_ms")
-                                    if prior_event and prior_event.get("type") == "flashback" else old_time
-                                ),
-                                "to_lap_time_ms": new_time,
-                                "from_lap_distance_m": (
-                                    prior_event.get("from_lap_distance_m")
-                                    if prior_event and prior_event.get("type") == "flashback" else old_distance
-                                ),
-                                "to_lap_distance_m": new_distance,
-                                "game_invalid": bool(lap_state.get("invalid", False)),
-                            }
-                            self.active_samples = []
-                            self.active_lap_events = []
-                            self.active_invalid = False
-                            self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
-                            self.capture_current_lap = False
-                            self.pending_restart_event = restart_event
-                            reasons.append("restart_lap_relocated_to_untimed_approach")
-                            decision = "restart_approach_armed"
-                        elif self.capture_current_lap and lap_number == old_number:
-                            retained = [
-                                sample for sample in self.active_samples
-                                if (
-                                    not isinstance(sample.get("current_lap_ms"), (int, float))
-                                    or float(sample["current_lap_ms"]) <= new_time
-                                ) and (
-                                    not isinstance(sample.get("lap_distance_m"), (int, float))
-                                    or float(sample["lap_distance_m"]) <= new_distance
-                                )
-                            ]
-                            removed = len(self.active_samples) - len(retained)
-                            self.active_samples = retained
-                            # A flashback creates a new game timeline. Validity
-                            # follows the current game flag on that timeline;
-                            # the recorder never invents invalidity.
-                            self.active_invalid = False
-                            self.active_lap_events.append({
-                                "type": "flashback", "session_time": (packet_meta or {}).get("session_time"),
-                                "frame_identifier": (packet_meta or {}).get("frame_identifier"),
-                                "from_lap_time_ms": old_time, "to_lap_time_ms": new_time,
-                                "from_lap_distance_m": old_distance, "to_lap_distance_m": new_distance,
-                                "pruned_sample_count": removed,
-                                "game_invalid": bool(lap_state.get("invalid", False)),
-                            })
-                            reasons.append("flashback_pruned_superseded_samples_capture_continues")
-                            decision = "flashback_continue_capture"
-                        else:
-                            self.active_samples = []
-                            self.active_lap_events = []
-                            self.active_invalid = False
-                            self.active_lap_setup = dict(self.current_setup) if self.current_setup else None
-                            self.capture_current_lap = False
-                            reasons.append(
-                                "discard_time_and_distance_reversed" if time_reversed and distance_reversed
-                                else "discard_time_reversed" if time_reversed else "discard_distance_reversed"
-                            )
-                            decision = "discard_partial_lap"
-                    elif not reasons:
-                        reasons.append("continue_current_lap")
-                        decision = "continue_capture" if self.capture_current_lap else "continue_not_capturing"
-            self.active_invalid = self.active_invalid or bool(lap_state["invalid"])
-            self.active_lap_state.update(lap_state)
+            applied = self.recorder_service.apply(
+                plan, self.recorder_state, observation,
+                current_setup=self.current_setup,
+                race_context=self._current_race_context,
+                finish_lap=self._finish_lap,
+                mark_session_recording=mark_session_recording,
+            )
+            decision = applied.code
+            reasons = applied.reasons
             self.latest.update(lap_state)
             self._touch()
             active_session = self.sessions.get(self.active_recording_id or "")
-            if self.race_store is not None and decision not in {"observe", "continue_capture", "continue_not_capturing"}:
+            if self.race_store is not None and decision not in {
+                DecisionCode.OBSERVE.value,
+                DecisionCode.CONTINUE_CAPTURE.value,
+                DecisionCode.CONTINUE_NOT_CAPTURING.value,
+            }:
                 self.race_store.append_event(
-                    float((packet_meta or {}).get("session_time") or 0), decision,
-                    {"reasons": reasons, "flags": flags, "packet": dict(lap_state)},
-                    "recorder", lap_number,
+                    float(observation.session_time or 0), decision,
+                    {"reasons": reasons, "flags": plan.flags, "packet": dict(lap_state)},
+                    "recorder", plan.new_lap_number,
                 )
             self._write_diagnostic({
                 "event": "lap_data_decision", "timestamp_utc": self._diagnostic_timestamp(),
                 "session_uid": session_uid,
-                "session_time": (packet_meta or {}).get("session_time"),
-                "frame_identifier": (packet_meta or {}).get("frame_identifier"),
-                "overall_frame_identifier": (packet_meta or {}).get("overall_frame_identifier"),
+                "session_time": observation.session_time,
+                "frame_identifier": observation.frame_identifier,
+                "overall_frame_identifier": observation.overall_frame_identifier,
                 "recording_session_id": self.active_recording_id,
                 "packet": dict(lap_state), "track_length_m": self.track_length_m,
                 "previous_packet": previous_packet,
@@ -1133,9 +716,10 @@ class SessionStore:
                 "after": {
                     "recording_status": active_session.status if active_session else None,
                     "capture_current_lap": self.capture_current_lap,
-                    "active_lap_number": self.active_lap_number, "sample_count": len(self.active_samples),
+                    "active_lap_number": self.active_lap_number,
+                    "sample_count": len(self.active_samples),
                 },
-                "flags": flags, "decision": decision, "reasons": reasons,
+                "flags": plan.flags, "decision": decision, "reasons": reasons,
             })
 
     def record_telemetry(self, telemetry: dict[str, Any], session_time: float, session_uid: int | None = None) -> None:
@@ -1293,7 +877,10 @@ class SessionStore:
         ))
         self.session_laps[session.id].append(lap)
         session.lap_ids.append(lap.id)
-        self._refresh_lap_index()
+        self.laps.append(lap)
+        self.lap_by_id[lap.id] = lap
+        self.session_lap_ids.setdefault(session.id, []).append(lap.id)
+        self._invalidate_lap(lap)
         payload = asdict(lap)
         payload["sample_count"] = len(lap.samples)
         directory = self.sessions_dir / session.id
@@ -1313,8 +900,39 @@ class SessionStore:
             ordered = real + [self.sessions[LEGACY_SESSION_ID]]
             return [self._session_summary(session) for session in ordered]
 
+    def list_sessions_page(
+        self, page: int = 1, page_size: int = 25, *, year: str = "", month: str = "", day: str = "",
+        mode: str = "", track_id: int | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            items = [session for session in self.sessions.values() if session.id != LEGACY_SESSION_ID]
+            if year:
+                items = [item for item in items if item.started_at[:4] == year]
+            if month:
+                items = [item for item in items if item.started_at[5:7] == month.zfill(2)]
+            if day:
+                items = [item for item in items if item.started_at[8:10] == day.zfill(2)]
+            if mode:
+                items = [item for item in items if item.mode == mode]
+            if track_id is not None:
+                items = [item for item in items if item.track_id == track_id]
+            items.sort(key=lambda item: item.started_at, reverse=True)
+            total = len(items)
+            page_size = max(1, min(int(page_size), 100))
+            pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(int(page), pages))
+            start = (page - 1) * page_size
+            return {
+                "sessions": [self._session_summary(item) for item in items[start:start + page_size]],
+                "pagination": {"page": page, "page_size": page_size, "pages": pages, "total": total},
+            }
+
     def _session_summary(self, session: RecordingSession) -> dict[str, Any]:
-        result = session.summary(self.session_laps[session.id])
+        cached = self.session_summary_cache.get(session.id)
+        if cached is None:
+            cached = session.summary(self.session_laps[session.id])
+            self.session_summary_cache[session.id] = cached
+        result = dict(cached)
         result["can_delete"] = (
             session.id != LEGACY_SESSION_ID
             and session.id != self.active_recording_id
@@ -1340,38 +958,29 @@ class SessionStore:
     def list_profiles(self, session_id: str | None = None) -> list[dict[str, Any]]:
         with self.lock:
             session = self.sessions.get(session_id or self.selected_session_id or "")
-            return self.profile_store.list(2025, session.track_id) if session and session.track_id is not None else self.profile_store.list(2025)
+            return self.profile_service.list_for_session(session)
 
     def save_profile(self, payload: Any) -> dict[str, Any]:
         with self.lock:
-            return self.profile_store.save(payload)
+            return self.profile_service.save(payload)
 
     def delete_profile(self, profile_id: str, confirmed: bool = False) -> dict[str, Any]:
         with self.lock:
-            if not confirmed:
-                raise CircuitProfileError("Circuit profile deletion must be explicitly confirmed")
-            result = self.profile_store.delete(profile_id)
-            affected = []
-            for session in self.sessions.values():
-                if session.circuit_profile_id == profile_id:
-                    session.circuit_profile_id = None
-                    self._persist_session(session)
-                    affected.append(session.id)
-            result["cleared_session_ids"] = affected
+            result = self.profile_service.delete(
+                profile_id,
+                confirmed=confirmed,
+                sessions=self.sessions,
+            )
+            for session_id in result.get("cleared_session_ids", []):
+                self.session_summary_cache.pop(session_id, None)
             return result
 
     def select_profile(self, session_id: str, profile_id: str) -> dict[str, Any]:
         with self.lock:
             session = self.sessions.get(session_id)
-            profile = self.profile_store.get(profile_id)
-            if session is None:
-                raise SessionStateError("Unknown session ID")
-            if profile is None:
-                raise SessionStateError("Unknown circuit profile")
-            if profile.get("packet_format") != session.packet_format or profile.get("track_id") != session.track_id:
-                raise SessionStateError("Circuit profile is incompatible with this session's format or track ID")
-            session.circuit_profile_id = profile_id
-            self._persist_session(session)
+            self.profile_service.select(session, profile_id)
+            assert session is not None
+            self.session_summary_cache.pop(session.id, None)
             return self._session_summary(session)
 
     def race_timeline(self, session_id: str, lap_from: int | None = None, lap_to: int | None = None) -> list[dict[str, Any]]:
@@ -1423,7 +1032,7 @@ class SessionStore:
         result = self.live_snapshot()
         with self.lock:
             result["laps"] = [
-                lap.summary(self.notes.get(lap.id, ""))
+                self._lap_summary(lap)
                 for lap in self.session_laps.get(self.selected_session_id or "", [])
             ]
         return result
@@ -1451,12 +1060,38 @@ class SessionStore:
             selected = session_id or self.selected_session_id or LEGACY_SESSION_ID
             if selected not in self.sessions:
                 raise SessionStateError("Unknown session ID")
-            return [lap.summary(self.notes.get(lap.id, "")) for lap in self.session_laps[selected]]
+            return [self._lap_summary(lap) for lap in self.session_laps[selected]]
 
     def list_all_laps(self) -> list[dict[str, Any]]:
         """Return all compact lap summaries in one response for initial cache hydration."""
         with self.lock:
-            return [lap.summary(self.notes.get(lap.id, "")) for lap in self.laps]
+            return [self._lap_summary(lap) for lap in self.laps]
+
+    def list_laps_page(
+        self, page: int = 1, page_size: int = 50, *, session_id: str | None = None,
+        track_id: int | None = None, mode: str = "", validity: str = "",
+    ) -> dict[str, Any]:
+        with self.lock:
+            if session_id is not None and session_id not in self.sessions:
+                raise SessionStateError("Unknown session ID")
+            items = self.session_laps[session_id] if session_id is not None else self.laps
+            if track_id is not None:
+                items = [lap for lap in items if lap.track_id == track_id]
+            if mode:
+                items = [lap for lap in items if lap.mode == mode]
+            if validity == "valid":
+                items = [lap for lap in items if not lap.invalid]
+            elif validity == "invalid":
+                items = [lap for lap in items if lap.invalid]
+            total = len(items)
+            page_size = max(1, min(int(page_size), 200))
+            pages = max(1, (total + page_size - 1) // page_size)
+            page = max(1, min(int(page), pages))
+            start = (page - 1) * page_size
+            return {
+                "laps": [self._lap_summary(lap) for lap in items[start:start + page_size]],
+                "pagination": {"page": page, "page_size": page_size, "pages": pages, "total": total},
+            }
 
     def get_lap_object(self, lap_id: str) -> Lap | None:
         if lap_id.startswith("pb:"):
@@ -1466,7 +1101,13 @@ class SessionStore:
                     return self._lap_from_payload(entry["lap"])
                 except (TypeError, KeyError, ValueError):
                     return None
-        return next((lap for lap in self.laps if lap.id == lap_id), None)
+        lap = self.lap_by_id.get(lap_id)
+        if lap is None:
+            return None
+        try:
+            return self._hydrate_lap(lap)
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
 
     def lap(self, lap_id: str) -> dict[str, Any] | None:
         with self.lock:
@@ -1480,73 +1121,17 @@ class SessionStore:
 
     @staticmethod
     def _atomic_json(path: Path, payload: dict[str, Any], compact: bool = False) -> None:
-        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-        temporary.write_text(
-            json.dumps(payload, separators=(",", ":")) if compact else json.dumps(payload, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(path)
+        SessionArchiveRepository.atomic_json(path, payload, compact)
 
     def amend_lap_setup(self, lap_id: str, values: Any) -> dict[str, Any]:
         """Amend only setup metadata, retaining exact pre-change lap/PB backups."""
-        clean = validate_manual_values(values)
         with self.lock:
-            lap = next((item for item in self.laps if item.id == lap_id), None)
-            if lap is None:
-                raise SessionStateError("Lap not found")
-            lap_path = self.capture_dir / f"{lap.id}.json" if lap.recording_session_id == LEGACY_SESSION_ID else self.sessions_dir / lap.recording_session_id / f"{lap.id}.json"
-            try:
-                original_lap = lap_path.read_bytes()
-                lap_payload = json.loads(original_lap)
-            except (OSError, ValueError, TypeError) as error:
-                raise SessionStateError("Original lap JSON is unavailable or invalid") from error
-
-            current = with_provenance(lap.setup, "legacy_decoded_udp") or {"_provenance": {}}
-            changed = {key: value for key, value in clean.items() if current.get(key) != value}
-            if not changed:
-                raise SetupValidationError("No setup values changed")
-
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            audit_dir = self.capture_dir / "audit" / "setup-amendments" / lap.id / stamp
-            audit_dir.mkdir(parents=True, exist_ok=False)
-            (audit_dir / "original-lap.json").write_bytes(original_lap)
-
-            pb_entry = next((entry for entry in self.pb_registry.entries.values() if entry.get("source_lap_id") == lap.id), None)
-            pb_path = None
-            if pb_entry is not None:
-                pb_path = self.pb_registry.path_for(str(pb_entry["key"]))
-                try:
-                    (audit_dir / "original-personal-best.json").write_bytes(pb_path.read_bytes())
-                except OSError as error:
-                    raise SessionStateError("PB record exists but cannot be backed up; no files were changed") from error
-
-            provenance = dict(current.get("_provenance") or {})
-            current.update(changed)
-            provenance.update({key: "manual" for key in changed})
-            current["_provenance"] = provenance
-            current["_amended_at"] = utc_now()
-            current["_audit_record"] = str(audit_dir.relative_to(self.capture_dir))
-            manifest = {
-                "lap_id": lap.id, "source_session_id": lap.recording_session_id,
-                "created_at": current["_amended_at"], "changed_fields": changed,
-                "preserved_fields": {key: value for key, value in (lap.setup or {}).items() if not key.startswith("_") and key not in changed},
-                "pb_key": pb_entry.get("key") if pb_entry else None,
-            }
-            (audit_dir / "amendment.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-            lap_payload["setup"] = current
-            self._atomic_json(lap_path, lap_payload, compact=True)
-            lap.setup = current
-            pb_synced = False
-            if pb_entry is not None:
-                self.pb_registry.update_source_setup(lap.id, current)
-                pb_synced = True
-            return {
-                "lap": lap.summary(self.notes.get(lap.id, "")), "setup_fields": setup_rows(current),
-                "changed_fields": list(changed), "pb_synced": pb_synced,
-                "pb_message": "Personal best snapshot synchronized" if pb_synced else "No PB snapshot found; the corrected lap will sync when the PB registry is built",
-                "audit_record": str(audit_dir.relative_to(self.capture_dir)),
-            }
+            lap = self.lap_by_id.get(lap_id)
+            result = self.amendment_service.amend(lap, values, self.notes.get(lap_id, ""))
+            assert lap is not None
+            self.archive.invalidate_lap_index(lap)
+            self._invalidate_lap(lap)
+            return result
 
     def set_note(self, lap_id: str, note: str) -> dict[str, Any] | None:
         with self.lock:
@@ -1558,8 +1143,11 @@ class SessionStore:
                 self.notes[lap_id] = clean_note
             else:
                 self.notes.pop(lap_id, None)
-            self.notes_path.write_text(json.dumps(self.notes, indent=2, sort_keys=True), encoding="utf-8")
+            self.archive.save_notes(self.notes)
             self.pb_registry.update_source_note(lap_id, clean_note)
+            metadata = self.lap_by_id.get(lap_id)
+            if metadata is not None:
+                self._invalidate_lap(metadata)
             return {"id": lap_id, "note": clean_note}
 
     def list_personal_bests(self) -> list[dict[str, Any]]:
@@ -1573,7 +1161,7 @@ class SessionStore:
     def rebuild_personal_bests(self) -> dict[str, int]:
         with self.lock:
             result = self.pb_registry.rebuild(
-                self.laps,
+                [self._hydrate_lap(lap) for lap in self.laps],
                 lambda session_id: self.sessions.get(session_id, self.sessions[LEGACY_SESSION_ID]).name,
                 lambda lap_id: self.notes.get(lap_id, ""),
             )
@@ -1611,121 +1199,61 @@ class SessionStore:
             return result
 
     def _raw_lap(self, lap: Lap) -> bytes | None:
-        if lap.recording_session_id == LEGACY_SESSION_ID:
-            path = self.capture_dir / f"{lap.id}.json"
-        else:
-            path = self.sessions_dir / lap.recording_session_id / f"{lap.id}.json"
-        try:
-            return path.read_bytes()
-        except OSError:
-            return None
+        return self.archive.raw_lap(lap)
 
     def export_session(
         self, session_id: str, scope: str, lap_ids: list[str], export_format: str,
-        report_type: str = "auto",
-    ) -> tuple[str, str, bytes]:
-        from .reports import ExportError, build_markdown, build_zip, safe_filename
-
+        report_type: str = "auto", *, file_output: bool = False,
+    ) -> tuple[str, str, bytes | Path]:
         with self.lock:
             session = self.sessions.get(session_id)
             if session is None:
                 raise ExportError("Unknown session ID")
+            circuit_profile = self.profile_store.get(session.circuit_profile_id) if session.circuit_profile_id else None
             available = self.session_laps[session_id]
             if scope == "session":
-                included = list(available)
-            elif scope == "selected":
-                requested = list(dict.fromkeys(lap_ids))
-                if not requested:
-                    raise ExportError("Select at least one lap before exporting")
-                lookup = {lap.id: lap for lap in available}
-                unknown = [lap_id for lap_id in requested if lap_id not in lookup]
-                if unknown:
-                    raise ExportError(f"Lap does not belong to this session: {unknown[0]}")
-                included = [lookup[lap_id] for lap_id in requested]
+                export_laps = [self._hydrate_lap(lap) for lap in available]
             else:
-                raise ExportError("Export scope must be 'session' or 'selected'")
-            continuous_path = self.sessions_dir / session.id / session.race_store_file if session.race_store_file else None
-            if not included and not (scope == "session" and continuous_path and continuous_path.exists()):
-                raise ExportError("This export contains no completed laps")
-            timeline: list[dict[str, Any]] | None = None
-            if session.race_store_file:
-                try:
-                    lap_numbers = [lap.number for lap in included]
-                    timeline = self._race_timeline_unlocked(
-                        session_id, min(lap_numbers) if lap_numbers else None, max(lap_numbers) if lap_numbers else None,
-                    )
-                except SessionStateError:
-                    timeline = None
-            if session.id == self.active_recording_id and self.race_store is not None:
-                storage_summary = self.race_store.summary()
-            elif continuous_path and continuous_path.exists():
-                try:
-                    storage_summary = RaceSessionStore.read_summary(continuous_path)
-                except sqlite3.Error:
-                    storage_summary = {"path": session.race_store_file, "error": "unreadable"}
-            else:
-                storage_summary = None
-            circuit_profile = self.profile_store.get(session.circuit_profile_id) if session.circuit_profile_id else None
-            report = build_markdown(
-                session, included, self.notes, track_name(session.track_id, session.track_name_override),
-                timeline, storage_summary, circuit_profile, report_type,
+                requested = set(lap_ids)
+                export_laps = [self._hydrate_lap(lap) for lap in available if lap.id in requested]
+            snapshot = capture_session_export(
+                archive=self.archive,
+                sessions_dir=self.sessions_dir,
+                session=session,
+                available_laps=export_laps,
+                notes=self.notes,
+                circuit_profile=circuit_profile,
+                active_store=self.race_store if session.id == self.active_recording_id else None,
+                scope=scope,
+                lap_ids=lap_ids,
+                export_format=export_format,
+                report_type=report_type,
             )
-            resolved_type = report_type if report_type != "auto" else ("race" if session.mode == "race" else "time_trial" if session.mode == "time_trial" else "lap_analysis")
-            base = safe_filename(f"{session.name}-{resolved_type.replace('_', '-')}")
-            if export_format == "markdown":
-                return f"{base}.md", "text/markdown; charset=utf-8", report.encode("utf-8")
-            if export_format == "zip":
-                raw = {lap.id: self._raw_lap(lap) for lap in included}
-                if any(value is None for value in raw.values()):
-                    missing = next(key for key, value in raw.items() if value is None)
-                    raise ExportError(f"Original JSON is unavailable for lap {missing}")
-                continuous_data = None
-                scoped_packets = None
-                if scope == "session" and session.race_store_file:
-                    path = self.sessions_dir / session.id / session.race_store_file
-                    if session.id == self.active_recording_id and self.race_store is not None:
-                        continuous_data = self.race_store.snapshot_bytes()
-                    elif path.exists():
-                        continuous_data = RaceSessionStore.read_snapshot(path)
-                elif scope == "selected" and session.race_store_file:
-                    starts = [lap.first_session_time for lap in included if lap.first_session_time is not None]
-                    ends = [lap.last_session_time for lap in included if lap.last_session_time is not None]
-                    if starts and ends:
-                        # Include a short boundary margin for slower state/event
-                        # packets immediately before and after the lap samples.
-                        scoped_packets = self._race_packet_export_unlocked(
-                            session, max(0.0, min(starts) - 1.0), max(ends) + 1.0,
-                        )
-                return f"{base}.zip", "application/zip", build_zip(
-                    report, session, included, raw, timeline, continuous_data, scoped_packets, circuit_profile,
-                )  # type: ignore[arg-type]
-            raise ExportError("Export format must be 'markdown' or 'zip'")
+        return render_session_export(snapshot, file_output=file_output)
 
     def export_lap_analysis(self, baseline_id: str, candidate_id: str) -> tuple[str, str, bytes]:
-        from .reports import build_lap_analysis_markdown, safe_filename
-
         with self.lock:
             baseline, candidate = self.get_lap_object(baseline_id), self.get_lap_object(candidate_id)
             if baseline is None or candidate is None:
                 missing = baseline_id if baseline is None else candidate_id
                 raise ExportError(f"Unknown lap ID: {missing}")
-            session = self.sessions.get(baseline.recording_session_id)
-            candidate_session = self.sessions.get(candidate.recording_session_id)
-            profile = self.profile_store.get(session.circuit_profile_id) if session and session.circuit_profile_id else None
-            if profile is None and candidate_session and candidate_session.circuit_profile_id:
-                profile = self.profile_store.get(candidate_session.circuit_profile_id)
-            if (
-                baseline.mode == candidate.mode == "race"
-                and baseline.recording_session_id != candidate.recording_session_id
-                and (not session or not candidate_session or session.circuit_profile_id != candidate_session.circuit_profile_id)
-            ):
-                raise ExportError("Cross-session race laps must select the same verified circuit profile")
-            report = build_lap_analysis_markdown(
-                baseline, candidate, self.notes.get(baseline.id, ""), self.notes.get(candidate.id, ""),
-                track_name(baseline.track_id), profile,
+            try:
+                profile = resolve_comparison_profile(
+                    baseline,
+                    candidate,
+                    self.sessions,
+                    self.profile_store,
+                )
+            except ComparisonPolicyError as error:
+                raise ExportError(str(error)) from error
+            snapshot = CapturedComparisonExport(
+                deepcopy(baseline),
+                deepcopy(candidate),
+                self.notes.get(baseline.id, ""),
+                self.notes.get(candidate.id, ""),
+                deepcopy(profile),
             )
-            filename = safe_filename(f"{track_name(baseline.track_id)}-lap-{baseline.number}-vs-{candidate.number}-analysis")
-            return f"{filename}.md", "text/markdown; charset=utf-8", report.encode("utf-8")
+        return render_comparison_export(snapshot)
 
 
 class UdpReceiver(Thread):

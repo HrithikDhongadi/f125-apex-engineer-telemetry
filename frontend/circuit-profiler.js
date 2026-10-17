@@ -17,7 +17,6 @@ function panSurface() {
     fill: "rgba(0,0,0,0.001)", listening: true,
   });
 }
-
 function placeAnchor(viewport, local, screen) {
   const radians = viewport.rotation() * Math.PI / 180;
   const scale = viewport.scaleX();
@@ -30,7 +29,7 @@ function editableTarget(target) {
   return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
 }
 
-class CircuitProfilerCanvas {
+export class CircuitProfilerCanvas {
   constructor(container, callbacks = {}) {
     this.container = container;
     this.callbacks = callbacks;
@@ -340,7 +339,7 @@ const PACE_COLORS = {
   labelBackground: "#08090b",
 };
 
-class PaceMapCanvas {
+export class PaceMapCanvas {
   constructor(container, callbacks = {}) {
     this.container = container;
     this.callbacks = callbacks;
@@ -551,6 +550,3 @@ class PaceMapCanvas {
     action();
   }
 }
-
-window.CircuitProfilerCanvas = CircuitProfilerCanvas;
-window.PaceMapCanvas = PaceMapCanvas;

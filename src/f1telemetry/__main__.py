@@ -1,4 +1,4 @@
-from .server import serve
+from .bootstrap import serve
 
 if __name__ == "__main__":
     serve()

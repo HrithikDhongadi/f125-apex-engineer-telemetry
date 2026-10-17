@@ -1,6 +1,7 @@
 {
   "name": "f125-apex-engineer-telemetry",
   "version": "1.0.0",
+  "type": "module",
   "private": true,
   "description": "A local-first F1 25 telemetry and lap-analysis tool for repeatable setup development.",
   "directories": {
@@ -8,10 +9,12 @@
   },
   "scripts": {
     "build": "npm run build:frontend",
-    "build:frontend": "esbuild frontend/circuit-profiler.js --bundle --format=iife --outfile=static/circuit-profiler.bundle.js",
-    "check:frontend": "esbuild frontend/circuit-profiler.js --bundle --format=iife --outfile=/tmp/f125-circuit-profiler-check.js",
-    "check:python": "python3 -m py_compile src/f1telemetry/*.py utils/*.py",
-    "test": "python3 -m unittest discover -s tests -v",
+    "build:frontend": "esbuild frontend/main.js --bundle --format=iife --outfile=static/app.bundle.js",
+    "check:frontend": "esbuild frontend/main.js --bundle --format=iife --outfile=/tmp/f125-dashboard-check.js",
+    "check:python": "python3 -m compileall -q src/f1telemetry utils",
+    "test:python": "python3 -m unittest discover -s tests -v",
+    "test:frontend": "node --test frontend/tests/*.test.js",
+    "test": "npm run test:python && npm run test:frontend",
     "check": "npm run check:python && npm run check:frontend && npm test"
   },
   "repository": {

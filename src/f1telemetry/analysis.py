@@ -7,7 +7,7 @@ from math import atan2, pi
 from typing import Any
 
 from .circuit_profiles import SILVERSTONE_SEED, profile_audit
-from .receiver import Lap
+from .domain.models import Lap
 
 TRACE_FIELDS = (
     "speed_kph", "throttle", "brake", "steering", "gear", "current_lap_ms",

@@ -13,7 +13,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.f1telemetry.receiver import SessionStateError, SessionStore  # noqa: E402
+from src.f1telemetry.application.offline_reports import OfflineReportService  # noqa: E402
+from src.f1telemetry.reports import ExportError  # noqa: E402
 
 
 def main() -> int:
@@ -24,12 +25,10 @@ def main() -> int:
     parser.add_argument("--report-type", choices=("auto", "race", "time_trial", "lap_analysis"), default="auto")
     args = parser.parse_args()
 
-    store = SessionStore(args.data_dir)
+    reports = OfflineReportService(args.data_dir)
     try:
-        _name, _mime, body = store.export_session(
-            args.session_id, "session", [], "markdown", args.report_type,
-        )
-    except SessionStateError as error:
+        _name, _mime, body = reports.export_markdown(args.session_id, args.report_type)
+    except ExportError as error:
         parser.error(str(error))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_name(f".{args.output.name}.{uuid4().hex}.tmp")
